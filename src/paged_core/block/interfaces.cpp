@@ -10,41 +10,37 @@ int Block::numTokensTotal() const {
     throw std::runtime_error("Block::numTokensTotal not implemented");
 }
 
-int Block::getExtraHash() const {
-    return 0;
-}
+// bool Block::isComputed() const {
+//     throw std::runtime_error("Block::isComputed not implemented");
+// }
 
-bool Block::isComputed() const {
-    throw std::runtime_error("Block::isComputed not implemented");
-}
+// void Block::setComputed(bool) {
+//     throw std::runtime_error("Block::setComputed not implemented");
+// }
 
-void Block::setComputed(bool) {
-    throw std::runtime_error("Block::setComputed not implemented");
-}
+// double Block::getLastAccessed() const {
+//     throw std::runtime_error("Block::getLastAccessed not implemented");
+// }
 
-double Block::getLastAccessed() const {
-    throw std::runtime_error("Block::getLastAccessed not implemented");
-}
+// void Block::setLastAccessed(double) {
+//     throw std::runtime_error("Block::setLastAccessed not implemented");
+// }
 
-void Block::setLastAccessed(double) {
-    throw std::runtime_error("Block::setLastAccessed not implemented");
-}
-
-int Block::getContentHash() const {
-    return 0;
-}
+// int Block::getContentHash() const {
+//     return 0;
+// }
 
 // ---------- Default implementations for BlockAllocator interface ----------
 
-std::shared_ptr<Block> BlockAllocator::allocate_mutable_block(std::shared_ptr<Block> /*prev_block*/, std::optional<int> /*extra_hash*/) {
+std::shared_ptr<Block> BlockAllocator::allocate_mutable_block(std::shared_ptr<Block> /*prev_block*/) {
     throw std::runtime_error("BlockAllocator::allocate_mutable_block not implemented");
 }
 
-std::shared_ptr<Block> BlockAllocator::allocate_immutable_block(std::shared_ptr<Block> /*prev_block*/, const std::vector<int>& /*token_ids*/, std::optional<int> /*extra_hash*/) {
+std::shared_ptr<Block> BlockAllocator::allocate_immutable_block(std::shared_ptr<Block> /*prev_block*/, const std::vector<int>& /*token_ids*/) {
     throw std::runtime_error("BlockAllocator::allocate_immutable_block not implemented");
 }
 
-std::vector<std::shared_ptr<Block>> BlockAllocator::allocate_immutable_blocks(std::shared_ptr<Block> /*prev_block*/, const std::vector<std::vector<int>>& /*block_token_ids*/, std::optional<int> /*extra_hash*/) {
+std::vector<std::shared_ptr<Block>> BlockAllocator::allocate_immutable_blocks(std::shared_ptr<Block> /*prev_block*/, const std::vector<std::vector<int>>& /*block_token_ids*/) {
     throw std::runtime_error("BlockAllocator::allocate_immutable_blocks not implemented");
 }
 
@@ -122,15 +118,15 @@ std::vector<int> BlockAllocator::find_cached_blocks_prefix(const std::vector<int
 
 // ---------- Default implementations for DeviceAwareBlockAllocator interface ----------
 
-std::shared_ptr<Block> DeviceAwareBlockAllocator::allocate_mutable_block(std::shared_ptr<Block> /*prev_block*/, Device /*device*/, std::optional<int> /*extra_hash*/) {
+std::shared_ptr<Block> DeviceAwareBlockAllocator::allocate_mutable_block(std::shared_ptr<Block> /*prev_block*/, Device /*device*/) {
     throw std::runtime_error("DeviceAwareBlockAllocator::allocate_mutable_block not implemented");
 }
 
-std::shared_ptr<Block> DeviceAwareBlockAllocator::allocate_immutable_block(std::shared_ptr<Block> /*prev_block*/, const std::vector<int>& /*token_ids*/, Device /*device*/, std::optional<int> /*extra_hash*/) {
+std::shared_ptr<Block> DeviceAwareBlockAllocator::allocate_immutable_block(std::shared_ptr<Block> /*prev_block*/, const std::vector<int>& /*token_ids*/, Device /*device*/) {
     throw std::runtime_error("DeviceAwareBlockAllocator::allocate_immutable_block not implemented");
 }
 
-std::vector<std::shared_ptr<Block>> DeviceAwareBlockAllocator::allocate_immutable_blocks(std::shared_ptr<Block> /*prev_block*/, const std::vector<std::vector<int>>& /*block_token_ids*/, Device /*device*/, std::optional<int> /*extra_hash*/) {
+std::vector<std::shared_ptr<Block>> DeviceAwareBlockAllocator::allocate_immutable_blocks(std::shared_ptr<Block> /*prev_block*/, const std::vector<std::vector<int>>& /*block_token_ids*/, Device /*device*/) {
     throw std::runtime_error("DeviceAwareBlockAllocator::allocate_immutable_blocks not implemented");
 }
 

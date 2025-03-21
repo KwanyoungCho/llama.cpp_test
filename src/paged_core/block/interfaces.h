@@ -13,6 +13,9 @@ enum class Device {
     GPU
 };
 
+// **추가:** BlockAllocator 전방 선언
+class BlockAllocator;
+
 // Abstract interface for a Block used in paged attention
 class Block {
 public:
@@ -32,6 +35,18 @@ public:
     virtual double getLastAccessed() const { throw std::runtime_error("Block::getLastAccessed not implemented"); }
     virtual void setLastAccessed(double) { throw std::runtime_error("Block::setLastAccessed not implemented"); }
     virtual int getContentHash() const { return 0; }
+
+    // Factory interface for creating Block objects, following the Python interface.
+    class Factory {
+    public:
+        virtual ~Factory() = default;
+        virtual std::shared_ptr<Block> operator()(std::shared_ptr<Block> prev_block,
+                                                    const std::vector<int>& token_ids,
+                                                    int block_size,
+                                                    BlockAllocator* allocator, // BlockAllocator가 여기서 사용됨
+                                                    int block_id = -1,
+                                                    bool computed = false) = 0;
+    };
 };
 
 // Abstract interface for a BlockAllocator
@@ -86,4 +101,4 @@ public:
     virtual std::vector<int> find_cached_blocks_prefix(const std::vector<int>& block_hashes, Device device = Device::GPU) = 0;
 };
 
-#endif // BLOCK_INTERFACES_H 
+#endif // BLOCK_INTERFACES_H
