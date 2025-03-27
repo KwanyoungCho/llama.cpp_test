@@ -9,59 +9,59 @@ class DummyBlock : public Block {
 public:
     DummyBlock(std::shared_ptr<Block> prev, int id, int capacity)
         : prev_block_(prev), block_id_(id), capacity_(capacity) {}
-
+    
     void appendTokenIds(const std::vector<int>& token_ids) override {
         token_ids_.insert(token_ids_.end(), token_ids.begin(), token_ids.end());
     }
-
+    
     int getBlockId() const override {
         return block_id_;
     }
-
+    
     void setBlockId(int id) override {
         block_id_ = id;
     }
-
+    
     std::vector<int>& getTokenIds() override {
         return token_ids_;
     }
-
+    
     int numEmptySlots() const override {
         return capacity_ - static_cast<int>(token_ids_.size());
     }
-
+    
     bool isFull() const override {
         return numEmptySlots() == 0;
     }
-
+    
     std::shared_ptr<Block> getPrevBlock() const override {
         return prev_block_;
     }
-
+    
     int numTokensTotal() const override {
         return token_ids_.size();
     }
-
+    
     bool isComputed() const override {
         throw std::runtime_error("Not implemented: isComputed");
     }
-
+    
     void setComputed(bool value) override {
         throw std::runtime_error("Not implemented: setComputed");
     }
-
+    
     double getLastAccessed() const override {
         throw std::runtime_error("Not implemented: getLastAccessed");
     }
-
+    
     void setLastAccessed(double timestamp) override {
         throw std::runtime_error("Not implemented: setLastAccessed");
     }
-
+    
     int getContentHash() const override {
         return 0;
     }
-
+    
 private:
     std::vector<int> token_ids_;
     int block_id_;
@@ -87,74 +87,38 @@ public:
 int main() {
     // DummyBlockFactory를 생성 후 shared_ptr로 관리합니다.
     std::shared_ptr<Block::Factory> factory = std::make_shared<DummyBlockFactory>();
-
+    
     // NaiveBlockAllocator 생성: 총 5개 블록, 각 블록 크기 100으로 초기화함.
     NaiveBlockAllocator allocator(factory, 5, 100);
-
-    // 초기 상태 출력
-    std::cout << "[초기 상태]" << std::endl;
-    std::cout << "총 블록 수: " << allocator.get_num_total_blocks() << std::endl;
-    std::cout << "남은 블록 수: " << allocator.get_num_free_blocks() << std::endl;
-    std::cout << "블록 크기: " << allocator.blockSize() << std::endl;
-
+    
     // allocate_mutable_block 테스트
     std::shared_ptr<Block> block1 = allocator.allocate_mutable_block(nullptr);
-    std::cout << "\n[allocate_mutable_block 테스트]" << std::endl;
-    std::cout << "블록1 ID: " << block1->getBlockId() << std::endl;
-
-    // block1에 토큰 1~5 추가
+    std::cout << "Block1 ID: " << block1->getBlockId() << std::endl;
+    
+    // block1에 토큰 1~5를 추가
     std::vector<int> tokens = {1, 2, 3, 4, 5};
     block1->appendTokenIds(tokens);
-    std::cout << "블록1 토큰 수: " << block1->getTokenIds().size() << std::endl;
-    std::cout << "블록1 남은 슬롯: " << block1->numEmptySlots() << std::endl;
-    std::cout << "블록1 전체 토큰 수: " << block1->numTokensTotal() << std::endl;
-    std::cout << "블록1 isFull: " << (block1->isFull() ? "true" : "false") << std::endl;
-
-    // setBlockId 테스트
-    block1->setBlockId(999);
-    std::cout << "블록1 ID 변경 후: " << block1->getBlockId() << std::endl;
-
+    std::cout << "Block1 token count: " << block1->getTokenIds().size() << std::endl;
+    
     // allocate_immutable_block 테스트 (block1을 이전 블록으로 사용하여 토큰 6,7,8 추가)
     std::shared_ptr<Block> block2 = allocator.allocate_immutable_block(block1, {6, 7, 8});
-    std::cout << "\n[allocate_immutable_block 테스트]" << std::endl;
-    std::cout << "블록2 ID: " << block2->getBlockId() << std::endl;
-    std::cout << "블록2 토큰 수: " << block2->getTokenIds().size() << std::endl;
-
-    // 예외 테스트: isComputed와 getLastAccessed 호출
-    try {
-        block2->isComputed();
-    } catch (const std::runtime_error& e) {
-        std::cout << "블록2 isComputed 예외: " << e.what() << std::endl;
-    }
-    try {
-        block2->getLastAccessed();
-    } catch (const std::runtime_error& e) {
-        std::cout << "블록2 getLastAccessed 예외: " << e.what() << std::endl;
-    }
-
+    std::cout << "Block2 ID: " << block2->getBlockId() << std::endl;
+    std::cout << "Block2 token count: " << block2->getTokenIds().size() << std::endl;
+    
     // allocate_immutable_blocks 테스트
-    std::vector<std::vector<int>> token_lists = { {9, 10}, {11, 12, 13} };
+    std::vector<std::vector<int>> token_lists = { {9,10}, {11,12,13} };
     std::vector<std::shared_ptr<Block>> blocks = allocator.allocate_immutable_blocks(block2, token_lists);
-    std::cout << "\n[allocate_immutable_blocks 테스트]" << std::endl;
-    std::cout << "생성된 불변 블록 수: " << blocks.size() << std::endl;
-    for (size_t i = 0; i < blocks.size(); ++i) {
-        std::cout << "불변 블록 " << i << " ID: " << blocks[i]->getBlockId()
-                  << ", 토큰 수: " << blocks[i]->getTokenIds().size() << std::endl;
-    }
-
-    // fork 테스트: block2를 기반으로 fork 변환
+    std::cout << "Allocated " << blocks.size() << " immutable blocks." << std::endl;
+    
+    // fork 테스트: block2를 fork로 생성 (더미 구현이므로 단순히 리턴)
     std::vector<std::shared_ptr<Block>> forked = allocator.fork(block2);
-    std::cout << "\n[fork 테스트]" << std::endl;
-    if (!forked.empty()) {
-        std::cout << "Fork된 블록 ID: " << forked[0]->getBlockId() << std::endl;
-    }
-
+    std::cout << "Forked block ID: " << forked[0]->getBlockId() << std::endl;
+    
     // swap_out 및 swap_in 테스트
-    std::cout << "\n[swap_out 및 swap_in 테스트]" << std::endl;
     allocator.swap_out(blocks);
     allocator.swap_in(blocks);
     if (!blocks.empty()) {
-        std::cout << "swap_in 후 첫번째 블록 ID: " << blocks[0]->getBlockId() << std::endl;
+        std::cout << "After swapIn, first block new ID: " << blocks[0]->getBlockId() << std::endl;
     }
 
     // 추가적인 깊이 있는 기능 테스트: mark, clear, common, 물리적 ID, COW, immutable 승격, 등

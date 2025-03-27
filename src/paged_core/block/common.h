@@ -10,225 +10,122 @@
 #include <cassert>
 #include <memory>
 #include <stdexcept>
+#include <unordered_set>
 
-// RefCounter: manages reference counts for block IDs
-class RefCounter {
+using BlockId = int;
+using RefCount = int;
+
+// RefCounterProtocol: 참조 카운터의 인터페이스
+class RefCounterProtocol {
 public:
-    // Initialize with all block indices
-    RefCounter(const std::vector<int>& allBlockIndices) {
-        for (int id : allBlockIndices) {
-            refcounts_[id] = 0;
-        }
-    }
-
-    // Increments reference count for blockId and returns new count
-    int incr(int blockId) {
-        assert(refcounts_.find(blockId) != refcounts_.end());
-        int pre = refcounts_[blockId];
-        assert(pre >= 0);
-        refcounts_[blockId] = pre + 1;
-        return refcounts_[blockId];
-    }
-
-    // Decrements reference count for blockId and returns new count
-    int decr(int blockId) {
-        assert(refcounts_.find(blockId) != refcounts_.end());
-        int count = refcounts_[blockId];
-        assert(count > 0);
-        refcounts_[blockId] = count - 1;
-        return refcounts_[blockId];
-    }
-
-    // Returns the reference count for blockId
-    int get(int blockId) const {
-        auto it = refcounts_.find(blockId);
-        assert(it != refcounts_.end());
-        return it->second;
-    }
-
-private:
-    std::unordered_map<int, int> refcounts_;
+    virtual ~RefCounterProtocol() = default;
+    virtual RefCount incr(BlockId block_id) = 0;
+    virtual RefCount decr(BlockId block_id) = 0;
+    virtual RefCount get(BlockId block_id) const = 0;
 };
 
-// ReadOnlyRefCounter provides read-only access to RefCounter
-class ReadOnlyRefCounter {
+// RefCounter: 블록 인덱스 집합에 대한 참조 카운트를 관리
+class RefCounter : public RefCounterProtocol {
 public:
-    ReadOnlyRefCounter(const RefCounter& refcounter) : refcounter_(refcounter) {}
+    template<typename Iterable>
+    RefCounter(const Iterable& all_block_indices);
     
-    int get(int blockId) const {
-        return refcounter_.get(blockId);
-    }
+    RefCount incr(BlockId block_id) override;
+    RefCount decr(BlockId block_id) override;
+    RefCount get(BlockId block_id) const override;
     
-    // Disable modifications
-    int incr(int) const {
-        throw std::runtime_error("Incr not allowed in ReadOnlyRefCounter");
-    }
-    int decr(int) const {
-        throw std::runtime_error("Decr not allowed in ReadOnlyRefCounter");
-    }
+    std::shared_ptr<class ReadOnlyRefCounter> as_readonly();
+
+private:
+    std::unordered_map<BlockId, RefCount> refcounts_;
+};
+
+// ReadOnlyRefCounter: RefCounter의 읽기 전용 뷰
+class ReadOnlyRefCounter : public RefCounterProtocol {
+public:
+    explicit ReadOnlyRefCounter(const RefCounter& refcounter);
+    
+    RefCount incr(BlockId block_id) override;
+    RefCount decr(BlockId block_id) override;
+    RefCount get(BlockId block_id) const override;
 
 private:
     const RefCounter& refcounter_;
 };
 
-// CopyOnWriteTracker tracks copy-on-write operations for blocks
+// CopyOnWriteTracker: 블록의 copy-on-write 작업을 추적하고 관리
 class CopyOnWriteTracker {
 public:
-    // Construct with a reference to a RefCounter (read-only view expected)
-    CopyOnWriteTracker(const RefCounter& refcounter) : refCounter_(refcounter) {}
-
-    // isAppendable: returns true if the block is not shared
-    bool isAppendable(const std::shared_ptr<Block>& block) const {
-        int id = block->getBlockId();
-        // If blockId is negative, treat it as unallocated/appendable
-        if (id < 0) {
-            return true;
-        }
-        return refCounter_.get(id) <= 1;
-    }
-
-    // Record a copy-on-write operation from srcBlockId to trgBlockId
-    void recordCow(int srcBlockId, int trgBlockId) {
-        assert(srcBlockId >= 0 && trgBlockId >= 0);
-        copyOnWrites_.emplace_back(srcBlockId, trgBlockId);
-    }
-
-    // Clears and returns the current copy-on-write mappings
-    std::vector<std::pair<int, int>> clearCows() {
-        auto cows = copyOnWrites_;
-        copyOnWrites_.clear();
-        return cows;
-    }
+    explicit CopyOnWriteTracker(const RefCounterProtocol& refcounter);
+    
+    bool is_appendable(const std::shared_ptr<Block>& block) const;
+    void record_cow(BlockId src_block_id, BlockId trg_block_id);
+    std::vector<std::pair<BlockId, BlockId>> clear_cows();
 
 private:
-    const RefCounter& refCounter_;
-    std::vector<std::pair<int, int>> copyOnWrites_;
+    std::vector<std::pair<BlockId, BlockId>> copy_on_writes_;
+    const RefCounterProtocol& refcounter_;
 };
 
-// Minimal BlockPool implementation
-// This pool pre-allocates block objects to avoid excessive allocations.
-// For simplicity, this minimal version does not reuse blocks from a pool.
+// BlockPool: 블록 객체를 미리 할당하여 과도한 할당/해제를 방지
 class BlockPool {
 public:
-    // BlockFactory: function to create a new Block given a previous block and block size
-    typedef std::function<std::shared_ptr<Block>(std::shared_ptr<Block> prevBlock, int blockSize)> BlockFactory;
+    using BlockFactory = Block::Factory*;
 
-    BlockPool(int blockSize, BlockFactory create_block, int poolSize)
-        : blockSize_(blockSize), create_block_(create_block), poolSize_(poolSize) {}
+    BlockPool(int block_size, BlockFactory create_block, BlockAllocator* allocator, int pool_size);
+    
+    std::shared_ptr<Block> init_block(
+        std::shared_ptr<Block> prev_block,
+        const std::vector<int>& token_ids,
+        int block_size,
+        int physical_block_id);
 
-    // Initializes a block: creates a block, sets its blockId, and appends tokenIds
-    std::shared_ptr<Block> initBlock(std::shared_ptr<Block> prevBlock,
-                                     const std::vector<int>& tokenIds,
-                                     int blockSize,
-                                     int physicalBlockId) {
-        auto block = create_block_(prevBlock, blockSize);
-        block->setBlockId(physicalBlockId);
-        block->appendTokenIds(tokenIds);
-        return block;
-    }
-
-    // In this minimal version, freeBlock is a no-op
-    void freeBlock(const std::shared_ptr<Block>& block) {
-        // No pooling logic implemented
-    }
+    void free_block(std::shared_ptr<Block> block);
+    
+    void increase_pool();
 
 private:
-    int blockSize_;
+    int block_size_;
     BlockFactory create_block_;
-    int poolSize_;
+    BlockAllocator* allocator_;
+    int pool_size_;
+    std::deque<int> free_ids_;
+    std::vector<std::shared_ptr<Block>> pool_;
 };
 
-// Minimal BlockList implementation for fast-access to physical block ids
+// BlockList: 물리적 블록 ID에 대한 빠른 접근을 위한 최적화 클래스
 class BlockList {
 public:
-    BlockList() {}
-
-    // Update the list with new blocks
-    void update(const std::vector<std::shared_ptr<Block>>& blocks) {
-        blocks_ = blocks;
-        blockIds_.clear();
-        for (auto& block : blocks_) {
-            blockIds_.push_back(block->getBlockId());
-        }
-    }
-
-    // Append a new block to the list
-    void append(const std::shared_ptr<Block>& block) {
-        blocks_.push_back(block);
-        blockIds_.push_back(block->getBlockId());
-    }
-
-    size_t size() const {
-        return blocks_.size();
-    }
-
-    std::shared_ptr<Block>& operator[](size_t index) {
-        return blocks_[index];
-    }
-
-    const std::vector<std::shared_ptr<Block>>& list() const {
-        return blocks_;
-    }
-
-    const std::vector<int>& ids() const {
-        return blockIds_;
-    }
-
-    void reset() {
-        blocks_.clear();
-        blockIds_.clear();
-    }
+    BlockList();
+    
+    void update(const std::vector<std::shared_ptr<Block>>& blocks);
+    void append_token_ids(int block_index, const std::vector<int>& token_ids);
+    void append(const std::shared_ptr<Block>& block);
+    
+    size_t size() const;
+    std::shared_ptr<Block>& operator[](size_t index);
+    const std::vector<std::shared_ptr<Block>>& list() const;
+    const std::vector<int>& ids() const;
+    void reset();
 
 private:
     std::vector<std::shared_ptr<Block>> blocks_;
-    std::vector<int> blockIds_;
+    std::vector<int> block_ids_;
 };
 
-// CacheMetricData: tracks cache metrics for blocks
+// CacheMetricData: 블록의 캐시 메트릭을 추적
 struct CacheMetricData {
     int num_completed_blocks = 0;
     float completed_block_cache_hit_rate = 0.0f;
     int num_incompleted_block_queries = 0;
     int num_incompleted_block_hit = 0;
-    int blockSize = 1000;
+    int block_size = 1000;
 
-    // Process a query and update metrics
-    void query(bool hit) {
-        num_incompleted_block_queries += 1;
-        if (hit) {
-            num_incompleted_block_hit += 1;
-        }
-        if (num_incompleted_block_queries == blockSize) {
-            float hit_rate = static_cast<float>(num_incompleted_block_hit) / num_incompleted_block_queries;
-            completed_block_cache_hit_rate = (completed_block_cache_hit_rate * num_completed_blocks + hit_rate) / (num_completed_blocks + 1);
-            num_incompleted_block_queries = 0;
-            num_incompleted_block_hit = 0;
-            num_completed_blocks += 1;
-        }
-    }
-
-    // Calculate the overall hit rate
-    float get_hit_rate() const {
-        float incomplete_ratio = static_cast<float>(num_incompleted_block_queries) / blockSize;
-        float total_blocks = num_completed_blocks + incomplete_ratio;
-        if (total_blocks == 0) return 0.0f;
-        float completed_block_hit = (num_completed_blocks > 0) ? (completed_block_cache_hit_rate * num_completed_blocks) : 0.0f;
-        float incompleted_block_hit = (num_incompleted_block_queries > 0) ? ((static_cast<float>(num_incompleted_block_hit) / num_incompleted_block_queries) * incomplete_ratio) : 0.0f;
-        return (completed_block_hit + incompleted_block_hit) / total_blocks;
-    }
+    void query(bool hit);
+    float get_hit_rate() const;
 };
 
-// Recursively retrieves all blocks from the beginning to the given last block
-inline std::vector<std::shared_ptr<Block>> getAllBlocksRecursively(const std::shared_ptr<Block>& lastBlock) {
-    std::vector<std::shared_ptr<Block>> allBlocks;
-    std::function<void(const std::shared_ptr<Block>&)> recurse = [&](const std::shared_ptr<Block>& block) {
-        if (block->getPrevBlock()) {
-            recurse(block->getPrevBlock());
-        }
-        allBlocks.push_back(block);
-    };
-    recurse(lastBlock);
-    return allBlocks;
-}
+// 마지막 블록부터 시작하여 모든 블록을 재귀적으로 가져옴
+std::vector<std::shared_ptr<Block>> get_all_blocks_recursively(const std::shared_ptr<Block>& last_block);
 
 #endif // PAGED_CORE_BLOCK_COMMON_H 

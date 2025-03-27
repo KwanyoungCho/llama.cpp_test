@@ -2,65 +2,85 @@
 #define NAIVE_BLOCK_H
 
 #include "interfaces.h"
+#include "common.h"
 #include <vector>
 #include <memory>
 #include <stdexcept>
 #include <deque>
 #include <set>
 #include <unordered_set>
+#include <unordered_map>
 
 // 전방 선언: BlockAllocator
-class BlockAllocator;
+// class BlockAllocator;
 
-class NaiveBlock : public Block, public std::enable_shared_from_this<NaiveBlock> {
+class NaiveBlock : public PooledBlock {
 public:
-    // 생성자 및 소멸자
-    NaiveBlock(std::shared_ptr<Block> prev_block, int block_size, BlockAllocator* allocator,
-               const std::vector<int>& initial_token_ids = std::vector<int>(),
+    NaiveBlock(std::shared_ptr<Block> prev_block, 
+               const std::vector<int>& token_ids,
+               int block_size,
+               BlockAllocator* allocator,
                int block_id = -1,
                std::shared_ptr<Block> cow_target = nullptr);
-    ~NaiveBlock() override;
-
-    // Block 인터페이스 구현 (인터페이스와 동일한 함수명 및 시그니처)
-    void appendTokenIds(const std::vector<int>& token_ids) override;
-    int getBlockId() const override;
-    void setBlockId(int id) override;
-    std::vector<int>& getTokenIds() override;
-    int numEmptySlots() const override;
-    bool isFull() const override;
-    std::shared_ptr<Block> getPrevBlock() const override;
     
-    // 추가 기능 (필요시 구현 또는 예외 발생)
-    int numTokensTotal() const override;
-    bool isComputed() const override;
-    void setComputed(bool value) override;
-    double getLastAccessed() const override;
-    void setLastAccessed(double timestamp) override;
-    int getContentHash() const override;
+    ~NaiveBlock() override = default;
+    
+    // Block 인터페이스 구현
+    void append_token_ids(const std::vector<int>& token_ids) override;
+    const std::vector<int>& token_ids() const override;
+    std::vector<int>& token_ids() override;
+    bool is_full() const override;
+    int num_empty_slots() const override;
+    std::shared_ptr<Block> prev_block() const override;
+    void set_prev_block(std::shared_ptr<Block> prev_block) override;
+    int block_id() const override;
+    void set_block_id(int block_id) override;
+    bool computed() const override;
+    void set_computed(bool value) override;
+    double last_accessed() const override;
+    void set_last_accessed(double timestamp) override;
+    int content_hash() const override;
+    int block_size() const override;
+    int num_tokens_total() const override { 
+        throw std::runtime_error("num_tokens_total is not used for naive block"); 
+    }
+    
+    // PooledBlock 인터페이스 구현
+    int pool_id() const override;
+    void set_pool_id(int pool_id) override;
 
 private:
-    // 내부 헬퍼 함수
-    void _appendTokenIdsNoCOW(const std::vector<int>& token_ids);
+    void _append_token_ids_no_cow(const std::vector<int>& token_ids);
 
-    // 멤버 변수
-    int _blockId;
-    std::vector<int> _tokenIds;
-    std::shared_ptr<Block> _prevBlock;
-    int _blockSize;
+    std::vector<int> _token_ids;
+    std::shared_ptr<Block> _prev_block;
+    int _block_size;
     BlockAllocator* _allocator;
-    std::shared_ptr<Block> _cowTarget; // copy-on-write 대상
+    int _block_id;
+    int _pool_id = -1;  // pool_id 멤버 변수 추가
+    std::shared_ptr<Block> _cow_target;
+    // bool _computed;
+    // double _last_accessed;
+    // mutable int _content_hash;
 };
 
 class NaiveBlockAllocator : public BlockAllocator {
 public:
-    // 생성자
-    NaiveBlockAllocator(std::shared_ptr<Block::Factory> create_block, int num_blocks, int block_size, const std::vector<int>& block_ids = std::vector<int>());
+    NaiveBlockAllocator(std::shared_ptr<Block::Factory> create_block,
+                       int num_blocks,
+                       int block_size,
+                       const std::vector<int>& block_ids = std::vector<int>(),
+                       std::shared_ptr<BlockPool> block_pool = nullptr);
 
-    // BlockAllocator 인터페이스 구현 (함수명을 인터페이스와 동일하게)
+    // BlockAllocator 인터페이스 구현
     std::shared_ptr<Block> allocate_mutable_block(std::shared_ptr<Block> prev_block) override;
-    std::shared_ptr<Block> allocate_immutable_block(std::shared_ptr<Block> prev_block, const std::vector<int>& token_ids) override;
-    std::vector<std::shared_ptr<Block>> allocate_immutable_blocks(std::shared_ptr<Block> prev_block, const std::vector<std::vector<int>>& block_token_ids) override;
-    void free(Block* block) override;
+    std::shared_ptr<Block> allocate_immutable_block(std::shared_ptr<Block> prev_block,
+                                                   const std::vector<int>& token_ids) override;
+    std::vector<std::shared_ptr<Block>> allocate_immutable_blocks(
+        std::shared_ptr<Block> prev_block,
+        const std::vector<std::vector<int>>& block_token_ids) override;
+    void free(std::shared_ptr<Block> block, bool keep_block_object = false) override;
+    void free_block_id(int block_id);
     std::vector<std::shared_ptr<Block>> fork(std::shared_ptr<Block> last_block) override;
     int get_num_total_blocks() const override;
     int get_num_free_blocks() const override;
@@ -71,28 +91,32 @@ public:
     std::vector<std::pair<int, int>> clear_copy_on_writes() override;
     void mark_blocks_as_accessed(const std::vector<int>& block_ids, double now) override;
     void mark_blocks_as_computed(const std::vector<int>& block_ids) override;
-    std::vector<int> get_common_computed_block_ids(const std::vector<std::vector<int>>& computed_seq_block_ids) override;
+    std::vector<int> get_common_computed_block_ids(
+        const std::vector<std::vector<int>>& computed_seq_block_ids) override;
     int cow_block_if_not_appendable(const Block& block) override;
     int promote_to_immutable_block(const Block& block) override;
     int get_num_full_blocks_touched(const std::vector<std::shared_ptr<Block>>& blocks) override;
-    float get_prefix_cache_hit_rate() override;
-    bool reset_prefix_cache() override;
-    std::vector<int> find_cached_blocks_prefix(const std::vector<int>& block_hashes) override;
+    float get_prefix_cache_hit_rate() override { return -1.0f; }
+    bool reset_prefix_cache() override { return true; }
+    std::vector<int> find_cached_blocks_prefix(const std::vector<int>& block_hashes) override {
+        return std::vector<int>();
+    }
 
-    // 추가: 블록 크기 getter
-    int blockSize() const;
-
-    // 멤버 변수
-    std::shared_ptr<Block::Factory> createBlock;
+    const RefCounter& refcounter() const { return *_ref_counter; }
+    int block_size() const { return _block_size; }
 
 private:
-    int _allocateBlockId();
-    void _freeBlockId(std::shared_ptr<Block> block);
-    void _freeBlockId(int blockId);
+    int _allocate_block_id();
+    void _free_block_id(std::shared_ptr<Block> block);
+    void _free_block_id(int block_id);
 
-    int _blockSize;
-    std::deque<int> _freeBlockIndices;
-    std::unordered_set<int> _allBlockIndices;
+    std::shared_ptr<Block::Factory> _create_block;
+    int _block_size;
+    std::deque<int> _free_block_indices;
+    std::unordered_set<int> _all_block_indices;
+    std::unique_ptr<BlockPool> _block_pool;
+    std::unique_ptr<CopyOnWriteTracker> _cow_tracker;
+    std::unique_ptr<RefCounter> _ref_counter;
 };
 
 #endif // NAIVE_BLOCK_H
