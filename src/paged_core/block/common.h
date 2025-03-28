@@ -96,19 +96,20 @@ private:
 // BlockList: 물리적 블록 ID에 대한 빠른 접근을 위한 최적화 클래스
 class BlockList {
 public:
-    BlockList();
-    
+    BlockList(const std::vector<std::shared_ptr<Block>>& blocks = std::vector<std::shared_ptr<Block>>());
     void update(const std::vector<std::shared_ptr<Block>>& blocks);
     void append_token_ids(int block_index, const std::vector<int>& token_ids);
     void append(const std::shared_ptr<Block>& block);
-    
     size_t size() const;
     std::shared_ptr<Block>& operator[](size_t index);
+    void set_block(size_t index, std::shared_ptr<Block> block);
     const std::vector<std::shared_ptr<Block>>& list() const;
     const std::vector<int>& ids() const;
     void reset();
 
 private:
+    void _add_block_id(int block_id);
+    void _update_block_id(int block_index, int new_block_id);
     std::vector<std::shared_ptr<Block>> blocks_;
     std::vector<int> block_ids_;
 };

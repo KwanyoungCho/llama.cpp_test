@@ -181,16 +181,15 @@ void BlockPool::free_block(std::shared_ptr<Block> block) {
 
 // ------------------- BlockList -------------------
 
-BlockList::BlockList() {}
+BlockList::BlockList(const std::vector<std::shared_ptr<Block>>& blocks) {
+    update(blocks);
+}
 
 void BlockList::update(const std::vector<std::shared_ptr<Block>>& blocks) {
     blocks_ = blocks;
     block_ids_.clear();
     for (const auto& block : blocks_) {
-        if (block->block_id() < 0) {
-            throw std::runtime_error("BlockList::update found negative blockId");
-        }
-        block_ids_.push_back(block->block_id());
+        _add_block_id(block->block_id());
     }
 }
 
@@ -202,13 +201,13 @@ void BlockList::append_token_ids(int block_index, const std::vector<int>& token_
     int prev_id = block->block_id();
     block->append_token_ids(token_ids);
     if (prev_id != block->block_id()) {
-        block_ids_[block_index] = block->block_id();
+        _update_block_id(block_index, block->block_id());
     }
 }
 
-void BlockList::append(const std::shared_ptr<Block>& block) {
-    blocks_.push_back(block);
-    block_ids_.push_back(block->block_id());
+void BlockList::append(const std::shared_ptr<Block>& new_block) {
+    blocks_.push_back(new_block);
+    _add_block_id(new_block->block_id());
 }
 
 size_t BlockList::size() const {
@@ -217,6 +216,14 @@ size_t BlockList::size() const {
 
 std::shared_ptr<Block>& BlockList::operator[](size_t index) {
     return blocks_[index];
+}
+
+void BlockList::set_block(size_t index, std::shared_ptr<Block> block) {
+    if (index >= blocks_.size()) {
+        throw std::runtime_error("Invalid block index in BlockList::set_block");
+    }
+    blocks_[index] = block;
+    _update_block_id(index, block->block_id());
 }
 
 const std::vector<std::shared_ptr<Block>>& BlockList::list() const {
@@ -232,7 +239,28 @@ void BlockList::reset() {
     block_ids_.clear();
 }
 
+void BlockList::_add_block_id(int block_id) {
+    if (block_id < 0) {
+        throw std::runtime_error("BlockList::_add_block_id found negative blockId");
+    }
+    block_ids_.push_back(block_id);
+}
+
+void BlockList::_update_block_id(int block_index, int new_block_id) {
+    if (new_block_id < 0) {
+        throw std::runtime_error("BlockList::_update_block_id found negative blockId");
+    }
+    block_ids_[block_index] = new_block_id;
+}
+
 // ------------------- CacheMetricData -------------------
+
+CacheMetricData::CacheMetricData() 
+    : num_completed_blocks(0)
+    , completed_block_cache_hit_rate(0.0f)
+    , num_incompleted_block_queries(0)
+    , num_incompleted_block_hit(0)
+    , block_size(1000) {}
 
 void CacheMetricData::query(bool hit) {
     num_incompleted_block_queries += 1;
