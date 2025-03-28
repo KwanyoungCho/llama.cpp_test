@@ -21,6 +21,7 @@ public:
                int block_size,
                BlockAllocator* allocator,
                int block_id = -1,
+               int pool_id = -1,
                std::shared_ptr<Block> cow_target = nullptr);
     
     ~NaiveBlock() override = default;
@@ -44,6 +45,8 @@ public:
     int num_tokens_total() const override { 
         throw std::runtime_error("num_tokens_total is not used for naive block"); 
     }
+    int pool_id() const override;
+    void set_pool_id(int pool_id) override;
 
 private:
     void _append_token_ids_no_cow(const std::vector<int>& token_ids);
@@ -53,6 +56,7 @@ private:
     int _block_size;
     BlockAllocator* _allocator;
     int _block_id;
+    int _pool_id;
     std::shared_ptr<Block> _cow_target;
 };
 

@@ -117,7 +117,7 @@ BlockPool::BlockPool(int block_size, BlockFactory create_block, BlockAllocator* 
             block_size_,               // block_size
             allocator_,                // allocator
             -1,                        // block_id
-            false                      // computed
+            -1                         // pool_id
         );
         pool_.push_back(block);
     }
@@ -136,7 +136,7 @@ void BlockPool::increase_pool() {
             block_size_,               // block_size
             allocator_,                // allocator
             -1,                        // block_id
-            false                      // computed
+            -1                         // pool_id
         );
         pool_.push_back(block);
     }
@@ -158,14 +158,19 @@ std::shared_ptr<Block> BlockPool::init_block(
     int pool_id = free_ids_.front();
     free_ids_.pop_front();
 
-    auto block = (*create_block_)(
+    // 기존 block 객체를 재사용
+    auto block = pool_[pool_id];
+    
+    // block을 새로운 상태로 초기화
+    block = (*create_block_)(
         prev_block,           // prev_block
         token_ids,           // token_ids
         block_size,          // block_size
         allocator_,          // allocator
         physical_block_id,   // block_id
-        false                // computed
+        pool_id              // pool_id
     );
+    
     pool_[pool_id] = block;
     return block;
 }
