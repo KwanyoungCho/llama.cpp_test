@@ -14,7 +14,7 @@
 // 전방 선언: BlockAllocator
 // class BlockAllocator;
 
-class NaiveBlock : public PooledBlock {
+class NaiveBlock : public Block {
 public:
     NaiveBlock(std::shared_ptr<Block> prev_block, 
                const std::vector<int>& token_ids,
@@ -44,10 +44,6 @@ public:
     int num_tokens_total() const override { 
         throw std::runtime_error("num_tokens_total is not used for naive block"); 
     }
-    
-    // PooledBlock 인터페이스 구현
-    int pool_id() const override;
-    void set_pool_id(int pool_id) override;
 
 private:
     void _append_token_ids_no_cow(const std::vector<int>& token_ids);
@@ -57,11 +53,7 @@ private:
     int _block_size;
     BlockAllocator* _allocator;
     int _block_id;
-    int _pool_id = -1;  // pool_id 멤버 변수 추가
     std::shared_ptr<Block> _cow_target;
-    // bool _computed;
-    // double _last_accessed;
-    // mutable int _content_hash;
 };
 
 class NaiveBlockAllocator : public BlockAllocator {

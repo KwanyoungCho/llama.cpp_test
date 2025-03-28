@@ -19,6 +19,7 @@ NaiveBlock::NaiveBlock(std::shared_ptr<Block> prev_block,
       _block_size(block_size),
       _allocator(allocator),
       _block_id(block_id),
+      _pool_id(-1),
       _cow_target(cow_target ? cow_target : nullptr) {
     _append_token_ids_no_cow(token_ids);
 }

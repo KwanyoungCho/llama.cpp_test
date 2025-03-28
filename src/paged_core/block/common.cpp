@@ -119,9 +119,6 @@ BlockPool::BlockPool(int block_size, BlockFactory create_block, BlockAllocator* 
             -1,                        // block_id
             false                      // computed
         );
-        if (auto pooled_block = std::dynamic_pointer_cast<PooledBlock>(block)) {
-            pooled_block->set_pool_id(i);
-        }
         pool_.push_back(block);
     }
 }
@@ -141,9 +138,6 @@ void BlockPool::increase_pool() {
             -1,                        // block_id
             false                      // computed
         );
-        if (auto pooled_block = std::dynamic_pointer_cast<PooledBlock>(block)) {
-            pooled_block->set_pool_id(i);
-        }
         pool_.push_back(block);
     }
 }
@@ -172,20 +166,12 @@ std::shared_ptr<Block> BlockPool::init_block(
         physical_block_id,   // block_id
         false                // computed
     );
-    if (auto pooled_block = std::dynamic_pointer_cast<PooledBlock>(block)) {
-        pooled_block->set_pool_id(pool_id);
-    }
     pool_[pool_id] = block;
     return block;
 }
 
 void BlockPool::free_block(std::shared_ptr<Block> block) {
-    if (auto pooled_block = std::dynamic_pointer_cast<PooledBlock>(block)) {
-        int pool_id = pooled_block->pool_id();
-        free_ids_.push_back(pool_id);
-    } else {
-        throw std::runtime_error("Block is not a PooledBlock in BlockPool::free_block");
-    }
+    free_ids_.push_back(block->pool_id());
 }
 
 // ------------------- BlockList -------------------

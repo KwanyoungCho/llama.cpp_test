@@ -47,6 +47,10 @@ public:
     virtual int content_hash() const { return 0; }
 
     virtual int block_size() const = 0;
+
+    // pool_id 관련 메서드 추가
+    virtual int pool_id() const = 0;
+    virtual void set_pool_id(int pool_id) = 0;
     
     // Factory interface for creating Block objects
     class Factory {
@@ -147,18 +151,6 @@ public:
     virtual std::vector<int> find_cached_blocks_prefix(
         const std::vector<int>& block_hashes,
         Device device = Device::GPU) = 0;
-};
-
-// 동적으로 추가할 수 없어 상속 받아서 구현
-class PooledBlock : public Block {
-public:
-    virtual ~PooledBlock() = default;
-    
-    // pool_id를 가져오는 메서드
-    virtual int pool_id() const = 0;
-    
-    // pool_id를 설정하는 메서드
-    virtual void set_pool_id(int pool_id) = 0;
 };
 
 #endif // BLOCK_INTERFACES_H
