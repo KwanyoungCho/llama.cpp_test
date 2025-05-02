@@ -4038,56 +4038,69 @@ struct llm_build_llama : public llm_graph_context {
     llm_build_llama(const llama_model & model, const llm_graph_params & params, ggml_cgraph * gf) : llm_graph_context(params) {
         const int64_t n_embd_head = hparams.n_embd_head_v;
 
+        // 확인: 키와 값의 임베딩 차원이 동일한지 확인
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+        // 확인: 회전 임베딩 차원이 헤드 차원과 동일한지 확인
         GGML_ASSERT(n_embd_head == hparams.n_rot);
 
-        ggml_tensor * cur;
-        ggml_tensor * inpL;
+        ggml_tensor * cur;        // 현재 처리 중인 텐서
+        ggml_tensor * inpL;       // 레이어 입력 텐서
 
+        // 토큰 임베딩 생성
         inpL = build_inp_embd(model.tok_embd);
 
-        // inp_pos - contains the positions
+        // 위치 정보를 담은 텐서 생성 (RoPE에 사용됨)
         ggml_tensor * inp_pos = build_inp_pos();
 
+        // 통합된 KV 캐시를 위한 어텐션 입력 준비
         auto * inp_attn = build_attn_inp_kv_unified();
 
+        // 어텐션 스케일 계산: 명시적으로 지정되지 않은 경우 1/sqrt(d_head) 사용
         const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+        
+        // 모든 레이어를 순회하며 그래프 구성
         for (int il = 0; il < n_layer; ++il) {
-            ggml_tensor * inpSA = inpL;
+            ggml_tensor * inpSA = inpL;  // 셀프 어텐션 입력 저장 (스킵 커넥션용)
 
-            // norm
+            // 정규화 (RMSNorm)
             cur = build_norm(inpL,
                     model.layers[il].attn_norm, NULL,
                     LLM_NORM_RMS, il);
-            cb(cur, "attn_norm", il);
+            cb(cur, "attn_norm", il);  // 콜백 함수로 텐서 등록
 
-            // self-attention
+            // 셀프 어텐션 블록 구성
             {
-                // rope freq factors for llama3; may return nullptr for llama2 and other models
+                // llama3용 RoPE 주파수 인자 가져오기 (llama2 등에서는 nullptr 반환)
                 ggml_tensor * rope_factors = static_cast<const llama_kv_cache_unified *>(memory)->cbs.get_rope_factors(n_ctx_per_seq, il);
 
-                // compute Q and K and RoPE them
+                // Q 행렬 계산 (LoRA 적용 가능)
                 ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
                 cb(Qcur, "Qcur", il);
+                // 바이어스가 있으면 추가
                 if (model.layers[il].bq) {
                     Qcur = ggml_add(ctx0, Qcur, model.layers[il].bq);
                     cb(Qcur, "Qcur", il);
                 }
 
+                // K 행렬 계산 (LoRA 적용 가능)
                 ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
                 cb(Kcur, "Kcur", il);
+                // 바이어스가 있으면 추가
                 if (model.layers[il].bk) {
                     Kcur = ggml_add(ctx0, Kcur, model.layers[il].bk);
                     cb(Kcur, "Kcur", il);
                 }
 
+                // V 행렬 계산 (LoRA 적용 가능)
                 ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
                 cb(Vcur, "Vcur", il);
+                // 바이어스가 있으면 추가
                 if (model.layers[il].bv) {
                     Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv);
                     cb(Vcur, "Vcur", il);
                 }
 
+                // Q에 RoPE(회전 위치 임베딩) 적용
                 Qcur = ggml_rope_ext(
                         ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, rope_factors,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
@@ -4095,6 +4108,7 @@ struct llm_build_llama : public llm_graph_context {
                         );
                 cb(Qcur, "Qcur", il);
 
+                // K에 RoPE(회전 위치 임베딩) 적용
                 Kcur = ggml_rope_ext(
                         ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, rope_factors,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
@@ -4102,34 +4116,39 @@ struct llm_build_llama : public llm_graph_context {
                         );
                 cb(Kcur, "Kcur", il);
 
+                // 어텐션 계산 및 출력 투영
                 cur = build_attn(inp_attn, gf,
                         model.layers[il].wo, model.layers[il].bo,
                         Qcur, Kcur, Vcur, nullptr, kq_scale, il);
             }
 
+            // 마지막 레이어에서는 사용되지 않는 토큰에 대한 계산 생략
             if (il == n_layer - 1) {
-                // skip computing output for unused tokens
                 ggml_tensor * inp_out_ids = build_inp_out_ids();
                 cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
                 inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
-            // For Granite architecture
+            // Granite 아키텍처를 위한 잔차 스케일링
             if (hparams.f_residual_scale) {
                 cur = ggml_scale(ctx0, cur, hparams.f_residual_scale);
             }
 
+            // 스킵 커넥션 적용 (어텐션 출력 + 입력)
             ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
             cb(ffn_inp, "ffn_inp", il);
 
-            // feed-forward network
+            // 피드포워드 네트워크 (FFN) 구성
             if (model.layers[il].ffn_gate_inp == nullptr) {
+                // 일반 FFN 경로
 
+                // 정규화 (RMSNorm)
                 cur = build_norm(ffn_inp,
                         model.layers[il].ffn_norm, NULL,
                         LLM_NORM_RMS, il);
                 cb(cur, "ffn_norm", il);
 
+                // SwiGLU 활성화 함수를 사용하는 병렬 FFN 구성
                 cur = build_ffn(cur,
                         model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   NULL,
                         model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, NULL,
@@ -4138,61 +4157,72 @@ struct llm_build_llama : public llm_graph_context {
                         LLM_FFN_SILU, LLM_FFN_PAR, il);
                 cb(cur, "ffn_out", il);
             } else {
-                // MoE branch
+                // MoE(Mixture of Experts) 경로
+                
+                // 정규화 (RMSNorm)
                 cur = build_norm(ffn_inp,
                         model.layers[il].ffn_norm, NULL,
                         LLM_NORM_RMS, il);
                 cb(cur, "ffn_norm", il);
 
+                // MoE FFN 구성 (여러 전문가 네트워크 중 일부를 선택하여 계산)
                 cur = build_moe_ffn(cur,
-                        model.layers[il].ffn_gate_inp,
-                        model.layers[il].ffn_up_exps,
-                        model.layers[il].ffn_gate_exps,
-                        model.layers[il].ffn_down_exps,
+                        model.layers[il].ffn_gate_inp,     // 전문가 선택을 위한 게이트
+                        model.layers[il].ffn_up_exps,      // 각 전문가의 업 프로젝션
+                        model.layers[il].ffn_gate_exps,    // 각 전문가의 게이트 프로젝션
+                        model.layers[il].ffn_down_exps,    // 각 전문가의 다운 프로젝션
                         nullptr,
-                        n_expert, n_expert_used,
-                        LLM_FFN_SILU, true,
-                        false, 0.0,
-                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        n_expert, n_expert_used,           // 전체 전문가 수와 사용할 전문가 수
+                        LLM_FFN_SILU, true,                // SiLU 활성화 함수 사용
+                        false, 0.0,                        // 노이즈 없음
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, // 소프트맥스 게이팅 함수
                         il);
                 cb(cur, "ffn_moe_out", il);
             }
 
-            // For Granite architecture
+            // Granite 아키텍처를 위한 잔차 스케일링
             if (hparams.f_residual_scale) {
                 cur = ggml_scale(ctx0, cur, hparams.f_residual_scale);
             }
 
+            // 스킵 커넥션 적용 (FFN 출력 + FFN 입력)
             cur = ggml_add(ctx0, cur, ffn_inp);
             cb(cur, "ffn_out", il);
 
+            // 컨텍스트 벡터 구성 (필요한 경우)
             cur = build_cvec(cur, il);
             cb(cur, "l_out", il);
 
-            // input for next layer
+            // 다음 레이어의 입력으로 현재 출력 설정
             inpL = cur;
         }
 
+        // 최종 출력 처리
         cur = inpL;
 
+        // 최종 정규화 (RMSNorm)
         cur = build_norm(cur,
                 model.output_norm, NULL,
                 LLM_NORM_RMS, -1);
-
         cb(cur, "result_norm", -1);
+        
+        // 임베딩 결과 저장
         res->t_embd = cur;
 
-        // lm_head
+        // 언어 모델 헤드 (토큰 예측을 위한 최종 선형 레이어)
         cur = build_lora_mm(model.output, cur);
 
-        // For Granite architecture
+        // Granite 아키텍처를 위한 로짓 스케일링
         if (hparams.f_logit_scale) {
             cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_logit_scale);
         }
 
         cb(cur, "result_output", -1);
+        
+        // 로짓 결과 저장
         res->t_logits = cur;
 
+        // 계산 그래프 구성 완료
         ggml_build_forward_expand(gf, cur);
     }
 };
@@ -11414,39 +11444,60 @@ struct llm_build_wavtokenizer_dec : public llm_graph_context {
     }
 };
 
+/**
+ * @brief 모델의 KV 캐시 메모리를 생성하는 함수
+ * 
+ * 모델 아키텍처에 따라 적절한 KV 캐시 메모리를 초기화하고 반환합니다.
+ * 서로 다른 아키텍처(MAMBA, RWKV, 기본 트랜스포머 등)는 서로 다른 메모리 관리 방식을 사용합니다.
+ * 
+ * @return llama_memory_i* 생성된 메모리 인터페이스 포인터
+ */
 llama_memory_i * llama_model::create_memory() const {
+    // 결과를 저장할 포인터 선언
     llama_memory_i * res;
-
+    // 모델 아키텍처에 따라 다른 방식으로 메모리 초기화
     switch (arch) {
-        case LLM_ARCH_MAMBA:
-        case LLM_ARCH_RWKV6:
-        case LLM_ARCH_RWKV6QWEN2:
+        // 특수 아키텍처: MAMBA, RWKV 계열 모델
+        case LLM_ARCH_MAMBA:        // MAMBA 아키텍처
+        case LLM_ARCH_RWKV6:        // RWKV 버전 6
+        case LLM_ARCH_RWKV6QWEN2:   // RWKV 버전 6 + QWEN2 변형
         case LLM_ARCH_RWKV7:
         case LLM_ARCH_ARWKV7:
-            {
+            {   
+                // 특수 아키텍처용 KV 캐시: RoPE 계수 계산 함수 없이 초기화
+                // 이 모델들은 표준 트랜스포머와 다른 방식으로 위치 정보를 처리
                 res = new llama_kv_cache_unified(hparams, {
-                    /*.get_rope_factors =*/ nullptr
+                    /*.get_rope_factors =*/ nullptr     // RoPE 계수 함수 사용 안 함
                 });
             } break;
+            // 기본 아키텍처: 표준 트랜스포머 계열 모델
         default:
             {
+                // 표준 KV 캐시: 동적 RoPE 계수 계산 함수와 함께 초기화
                 res = new llama_kv_cache_unified(hparams, {
+                    // RoPE 계수를 동적으로 결정하는 람다 함수
                     /*.get_rope_factors =*/ [this](uint32_t n_ctx_per_seq, int il) {
+                        // 컨텍스트 크기와 레이어에 따라 적절한 RoPE 주파수 인자 선택
                         // choose long/short freq factors based on the context size
+
+                        // 1. 레이어별 사전 계산된 주파수가 있으면 그것을 사용
                         if (layers[il].rope_freqs != nullptr) {
                             return layers[il].rope_freqs;
                         }
 
+                        // 2. 원본 YaRN 컨텍스트 크기보다 큰 경우
+                        // -> 긴 컨텍스트용 RoPE 인자 사용 (더 낮은 주파수)
                         if (n_ctx_per_seq > hparams.n_ctx_orig_yarn) {
                             return layers[il].rope_long;
                         }
 
-                        return layers[il].rope_short;
+                        // 3. 기본적으로는 짧은 컨텍스트용 RoPE 인자 사용
+                        return layers[il].rope_short;   // 짧은 시퀀스용 RoPE 인자
                     }
                 });
             }
     }
-
+    // 생성된 메모리 객체 반환
     return res;
 }
 

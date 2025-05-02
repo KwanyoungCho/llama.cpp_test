@@ -572,13 +572,15 @@ std::string string_from(const struct llama_context * ctx, const std::vector<llam
                 detokenized.end(),
                 [](const unsigned char c) { return !std::isprint(c); }),
             detokenized.end());
-
-        buf << "'" << detokenized << "'"
-            << ":" << std::to_string(token);
+        //내가추가---------------------------------------------------
+        // buf << "'" << detokenized << "'"
+        //     << ":" << std::to_string(token);
+        buf << "'" << detokenized << "'";
+        //---------------------------------------------------
     }
 
     buf << " ]";
-
+    
     return buf.str();
 }
 

@@ -128,6 +128,10 @@ struct llama_context {
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
 
+    //내가추가----------------------------------------
+    friend const llama_kv_cache_unified * llama_get_kv_cache_unified(const llama_context * ctx);
+    //----------------------------------------------------
+
 private:
     //
     // output

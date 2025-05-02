@@ -1311,32 +1311,78 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+/**
+ * @brief 통합 KV 캐시를 사용한 어텐션 연산을 위한 입력 객체를 구축하는 함수
+ * 
+ * 이 함수는 트랜스포머 모델의 셀프 어텐션 메커니즘에서 사용할 KV 캐시 및 
+ * 어텐션 마스크 등의 필요한 텐서들을 초기화하고 설정합니다.
+ * 
+ * @return 초기화된 어텐션 입력 객체 포인터
+ */
 llm_graph_input_attn_kv_unified * llm_graph_context::build_attn_inp_kv_unified() const {
-    const llama_kv_cache_unified * kv_self = static_cast<const llama_kv_cache_unified *>(memory);
+    // 메모리 객체를 통합 KV 캐시 타입으로 캐스팅
+    const llama_kv_cache_unified * kv_self = static_cast<const llama_kv_cache_unified *>(memory); //kv ㅂㄹㅇ
 
+    // 하이퍼파라미터, 컨텍스트 파라미터, KV 캐시를 사용하여 어텐션 입력 객체 생성
     auto inp = std::make_unique<llm_graph_input_attn_kv_unified>(hparams, cparams, kv_self);
 
+    // 현재 활성화된 KV 캐시 셀의 수
     const auto n_kv = kv_self->n;
 
+    // 어텐션 마스크 텐서 생성 (KQ 마스크)
+    // 크기: [n_kv, n_tokens] - KV 캐시에 있는 각 키와 현재 쿼리 토큰 간의 어텐션 마스크
+    // GGML_PAD는 메모리 정렬 최적화를 위한 패딩을 추가
     inp->self_kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
-    //cb(inp->self_kq_mask, "KQ_mask", -1);
-    ggml_set_input(inp->self_kq_mask);
+    //cb(inp->self_kq_mask, "KQ_mask", -1); // 디버깅용 콜백 (주석 처리됨)
+    ggml_set_input(inp->self_kq_mask); // 이 텐서를 입력 텐서로 표시 (런타임에 값이 제공됨)
 
+    // Flash Attention 최적화를 사용하는 경우, 마스크를 F16 타입으로 변환
+    // Flash Attention은 F16 타입을 사용해 GPU에서 더 효율적으로 실행됨
     inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
 
+    // 슬라이딩 윈도우 어텐션(SWA)을 사용하는 경우 - 특정 LLAMA 변형에서만 사용됨
     if (hparams.n_swa_pattern > 1) {
+        // n_swa가 설정되어 있는지 확인 (슬라이딩 윈도우 크기)
         GGML_ASSERT(hparams.n_swa > 0);
 
+        // SWA용 추가 마스크 생성
         inp->self_kq_mask_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
-        //cb(inp->self_kq_mask_swa, "KQ_mask_swa", -1);
-        ggml_set_input(inp->self_kq_mask_swa);
+        //cb(inp->self_kq_mask_swa, "KQ_mask_swa", -1); // 디버깅용 콜백 (주석 처리됨)
+        ggml_set_input(inp->self_kq_mask_swa); // 이 텐서를 입력 텐서로 표시
 
+        // Flash Attention용으로 SWA 마스크도 필요시 F16으로 변환
         inp->self_kq_mask_swa_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask_swa, GGML_TYPE_F16) : inp->self_kq_mask_swa;
     }
 
+    // 입력 객체를 결과 컨텍스트에 추가하고 포인터 반환
+    // res->add_input은 입력 객체의 소유권을 결과 컨텍스트에 이전하고 포인터를 반환
     return (llm_graph_input_attn_kv_unified *) res->add_input(std::move(inp));
 }
 
+/**
+ * @brief KV 캐시를 사용한 어텐션 연산 수행 함수 (통합 KV 캐시 버전)
+ * 
+ * 현재 토큰의 Query 벡터와 KV 캐시에 저장된 이전 토큰들의 Key, Value 벡터를 사용하여
+ * 어텐션 연산을 수행하고, 새 토큰의 K, V 값을 캐시에 저장하는 함수입니다.
+ * 
+ * 이 함수는 다음과 같은 주요 작업을 수행합니다:
+ * 1. 현재 토큰의 K, V 값을 KV 캐시에 저장
+ * 2. KV 캐시에서 저장된 키와 값을 가져와 어텐션 계산에 사용
+ * 3. 어텐션 마스크를 적용하여 필요한 토큰만 참조하도록 함
+ * 4. 어텐션 계산 후 출력 가중치와 바이어스 적용
+ * 
+ * @param inp       KV 캐시 어텐션 입력 객체 (어텐션 마스크 등 포함)
+ * @param gf        GGML 계산 그래프
+ * @param wo        출력 가중치 행렬 (어텐션 결과를 모델 차원으로 투영)
+ * @param wo_b      출력 바이어스
+ * @param q_cur     현재 토큰의 Query 텐서 [n_embd_head, n_head, n_tokens]
+ * @param k_cur     현재 토큰의 Key 텐서 [n_embd_head, n_head_kv, n_tokens]
+ * @param v_cur     현재 토큰의 Value 텐서 [n_embd_v_gqa, n_tokens]
+ * @param kq_b      Key-Query 바이어스 (없으면 nullptr)
+ * @param kq_scale  어텐션 스케일 인자 (보통 1/√d_k)
+ * @param il        현재 레이어 인덱스
+ * @return          어텐션 연산의 결과 텐서
+ */
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv_unified * inp,
         ggml_cgraph * gf,
@@ -1348,69 +1394,95 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * kq_b,
             float     kq_scale,
             int       il) const {
-    // these nodes are added to the graph together so that they are not reordered
-    // by doing so, the number of splits in the graph is reduced
+    // 노드 재정렬 방지를 위해 Q, K, V 텐서를 함께 그래프에 추가
+    // 이렇게 하면 그래프의 분할(split) 수가 줄어들어 성능 향상
     ggml_build_forward_expand(gf, q_cur);
     ggml_build_forward_expand(gf, k_cur);
     ggml_build_forward_expand(gf, v_cur);
 
+    // 메모리 객체를 KV 캐시로 캐스팅
     const llama_kv_cache_unified * kv_self = static_cast<const llama_kv_cache_unified *>(memory);
+    // 컨텍스트 길이 (캐시 크기와 일치해야 함)
     const auto & n_ctx = cparams.n_ctx;
 
+    // 레이어별 GQA(Grouped Query Attention) K, V 임베딩 차원
     const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
     const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
+    // 현재 처리 중인 토큰 수
     const auto n_tokens = q_cur->ne[2];
 
+    // Value 텐서 전치 여부 (Flash Attention 사용 시 전치하지 않음)
     const bool v_trans = !cparams.flash_attn;
 
-    // store to KV cache
+    // 새 토큰의 K, V 값을 KV 캐시에 저장하는 부분
     {
+        // 순환 모델이 아닌지 확인 (순환 모델은 다른 방식으로 처리)
         GGML_ASSERT(!kv_self->recurrent);
 
+        // 현재 KV 캐시의 헤드 위치 (새 토큰이 저장될 시작 위치)
         const auto kv_head = kv_self->head;
 
+        // 캐시 크기가 컨텍스트 크기와 일치하는지 확인
         GGML_ASSERT(kv_self->size == n_ctx);
 
+        // K 캐시의 저장 위치에 대한 뷰 생성
+        // n_tokens*n_embd_k_gqa 크기의 연속적인 메모리 블록을 kv_head 위치부터 선택
         ggml_tensor * k_cache_view = ggml_view_1d(ctx0, kv_self->k_l[il], n_tokens*n_embd_k_gqa, ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa)*kv_head);
         //cb(k_cache_view, "k_cache_view", il);
 
-        // note: storing RoPE-ed version of K in the KV cache
+        // 현재 토큰의 K 값(RoPE 적용 후)을 KV 캐시에 복사
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cur, k_cache_view));
 
+        // V 텐서 차원 확인
         assert(v_cur->ne[0] == n_embd_v_gqa && v_cur->ne[1] == n_tokens);
 
+        // V 캐시 뷰 변수 초기화
         ggml_tensor * v_cache_view = nullptr;
 
+        // Flash Attention 사용 여부에 따라 V 캐시 뷰 다르게 생성
         if (!v_trans) {
+            // Flash Attention 사용 시 (V 전치 없음): 1D 뷰 사용
             v_cache_view = ggml_view_1d(ctx0, kv_self->v_l[il], n_tokens*n_embd_v_gqa, ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa)*kv_head);
         } else {
-            // note: the V cache is transposed when not using flash attention
+            // Flash Attention 미사용 시: 전치된 2D 뷰 사용
+            // V 캐시는 [n_tokens, n_embd_v_gqa] 형태로 저장
             v_cache_view = ggml_view_2d(ctx0, kv_self->v_l[il], n_tokens, n_embd_v_gqa,
                     (  n_ctx)*ggml_element_size(kv_self->v_l[il]),
                     (kv_head)*ggml_element_size(kv_self->v_l[il]));
 
+            // V 텐서 전치 (Flash Attention 미사용 시 필요)
             v_cur = ggml_transpose(ctx0, v_cur);
         }
         //cb(v_cache_view, "v_cache_view", il);
 
+        // 현재 토큰의 V 값을 KV 캐시에 복사
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_cur, v_cache_view));
     }
 
+    // 슬라이딩 윈도우 어텐션(SWA) 사용 여부 확인
     const bool is_swa = hparams.is_swa(il);
 
+    // 적절한 KQ 마스크 선택 (SWA 사용 시 특별한 마스크 사용)
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
+    // 현재 활성화된 KV 캐시 셀 수
     const auto n_kv = kv_self->n;
 
+    // KV 헤드 수 (GQA에서 Q 헤드 수보다 작을 수 있음)
     const int64_t n_head_kv = hparams.n_head_kv(il);
 
+    // 헤드당 K, V 임베딩 차원
     const auto & n_embd_head_k = hparams.n_embd_head_k;
     const auto & n_embd_head_v = hparams.n_embd_head_v;
 
+    // Q 텐서 형태 변환: [n_embd_head, n_head, n_tokens] -> [n_head, n_tokens, n_embd_head]
+    // 어텐션 연산을 위한 적절한 차원 순서로 변경
     ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
     //cb(q, "q", il);
 
+    // KV 캐시에서 K 값 가져오기
+    // 캐시 전체에 대한 3D 뷰 생성: [n_embd_head_k, n_kv, n_head_kv]
     ggml_tensor * k =
         ggml_view_3d(ctx0, kv_self->k_l[il],
                 n_embd_head_k, n_kv, n_head_kv,
@@ -1419,21 +1491,28 @@ ggml_tensor * llm_graph_context::build_attn(
                 0);
     //cb(k, "k", il);
 
+    // KV 캐시에서 V 값 가져오기
+    // Flash Attention 사용 여부에 따라 다른 메모리 레이아웃 사용
     ggml_tensor * v = !v_trans ?
+        // Flash Attention 사용 시: [n_embd_head_v, n_kv, n_head_kv] 형태
         ggml_view_3d(ctx0, kv_self->v_l[il],
                 n_embd_head_v, n_kv, n_head_kv,
                 ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa),
                 ggml_row_size(kv_self->v_l[il]->type, n_embd_head_v),
                 0) :
+        // Flash Attention 미사용 시: [n_kv, n_embd_head_v, n_head_kv] 형태 (전치됨)
         ggml_view_3d(ctx0, kv_self->v_l[il],
                 n_kv, n_embd_head_v, n_head_kv,
                 ggml_element_size(kv_self->v_l[il])*n_ctx,
                 ggml_element_size(kv_self->v_l[il])*n_ctx*n_embd_head_v,
                 0);
 
+    // 실제 MHA(Multi-Head Attention) 연산 수행
+    // Q: 현재 토큰의 쿼리, K/V: KV 캐시의 값들
     ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_trans, kq_scale);
     cb(cur, "kqv_out", il);
 
+    // 어텐션 결과에 출력 가중치 적용 (LoRA 가능)
     if (wo) {
         cur = build_lora_mm(wo, cur);
     }
@@ -1442,10 +1521,12 @@ ggml_tensor * llm_graph_context::build_attn(
         //cb(cur, "kqv_wo", il);
     }
 
+    // 출력 바이어스 추가 (있는 경우)
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // 최종 어텐션 출력 반환
     return cur;
 }
 

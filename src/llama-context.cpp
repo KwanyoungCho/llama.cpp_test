@@ -1,102 +1,123 @@
-#include "llama-context.h"
+// llama-context.cpp - LLaMA 모델의 추론 컨텍스트 관리를 위한 코드
+// 이 파일은 모델 상태, KV 캐시, 계산 그래프 등을 관리하는 핵심 컴포넌트입니다
 
-#include "llama-impl.h"
-#include "llama-io.h"
-#include "llama-mmap.h"
-#include "llama-model.h"
-#include "llama-kv-cache.h"
+#include "llama-context.h"  // 컨텍스트 관리 관련 선언이 포함된 헤더 파일
 
-#include <cassert>
-#include <cstring>
-#include <stdexcept>
-#include <cinttypes>
+// 필요한 내부 구현 헤더 파일들 포함
+#include "llama-impl.h"     // 내부 구현 세부사항
+#include "llama-io.h"       // 입출력 관련 기능
+#include "llama-mmap.h"     // 메모리 매핑 기능
+#include "llama-model.h"    // 모델 구조체 및 관련 기능
+#include "llama-kv-cache.h" // Key-Value 캐시 관리
+
+// 표준 라이브러리 헤더 파일들
+#include <cassert>      // 단언문(assert) 매크로
+#include <cstring>      // 문자열 처리 함수
+#include <stdexcept>    // 표준 예외 클래스
+#include <cinttypes>    // 정수 타입 서식 지정자
 
 //
-// llama_context
+// llama_context 클래스 구현
 //
 
+// llama_context 생성자 - 추론 컨텍스트 초기화
+// model: 로드된 LLaMA 모델 인스턴스
+// params: 컨텍스트 파라미터(컨텍스트 크기, 스레드 수 등)
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
-    model(model) {
+    model(model) {  // 모델 참조 초기화
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
-    t_start_us = model.t_start_us;
-    t_load_us  = model.t_load_us;
+    // 모델 로딩 시간 통계 복사
+    t_start_us = model.t_start_us;  // 시작 시간(마이크로초)
+    t_load_us  = model.t_load_us;   // 로딩에 소요된 시간(마이크로초)
 
-    const auto & hparams = model.hparams;
+    const auto & hparams = model.hparams;  // 모델 하이퍼파라미터 참조
 
-    cparams.n_seq_max        = std::max(1u, params.n_seq_max);
-    cparams.n_threads        = params.n_threads;
-    cparams.n_threads_batch  = params.n_threads_batch;
-    cparams.yarn_ext_factor  = params.yarn_ext_factor;
-    cparams.yarn_attn_factor = params.yarn_attn_factor;
-    cparams.yarn_beta_fast   = params.yarn_beta_fast;
-    cparams.yarn_beta_slow   = params.yarn_beta_slow;
-    cparams.defrag_thold     = params.defrag_thold;
-    cparams.embeddings       = params.embeddings;
-    cparams.offload_kqv      = params.offload_kqv;
-    cparams.flash_attn       = params.flash_attn;
-    cparams.no_perf          = params.no_perf;
-    cparams.pooling_type     = params.pooling_type;
-    cparams.warmup           = false;
+    // 컨텍스트 파라미터 초기화 - 사용자 지정 값 또는 기본값 사용
+    cparams.n_seq_max        = std::max(1u, params.n_seq_max);        // 최대 시퀀스 수(최소 1)
+    cparams.n_threads        = params.n_threads;                       // 추론에 사용할 스레드 수
+    cparams.n_threads_batch  = params.n_threads_batch;                 // 배치 처리에 사용할 스레드 수
+    cparams.yarn_ext_factor  = params.yarn_ext_factor;                 // YaRN 확장 계수
+    cparams.yarn_attn_factor = params.yarn_attn_factor;                // YaRN 어텐션 계수
+    cparams.yarn_beta_fast   = params.yarn_beta_fast;                  // YaRN 빠른 보정 차원
+    cparams.yarn_beta_slow   = params.yarn_beta_slow;                  // YaRN 느린 보정 차원
+    cparams.defrag_thold     = params.defrag_thold;                    // KV 캐시 조각 모음 임계값
+    cparams.embeddings       = params.embeddings;                      // 임베딩 계산 활성화 여부
+    cparams.offload_kqv      = params.offload_kqv;                     // KQV 연산 GPU 오프로딩 여부
+    cparams.flash_attn       = params.flash_attn;                      // Flash Attention 사용 여부
+    cparams.no_perf          = params.no_perf;                         // 성능 측정 비활성화 여부
+    cparams.pooling_type     = params.pooling_type;                    // 풀링 타입
+    cparams.warmup           = false;                                  // 웜업 비활성화(초기 상태)
 
+    // 0이나 0.0f가 전달되면 모델의 훈련 값 사용, 그렇지 않으면 사용자 지정 값 사용
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
+    // YaRN 원본 컨텍스트 크기 설정 (우선순위: 파라미터 > 모델 하이퍼파라미터 > 훈련 컨텍스트 크기)
     cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
                                hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
                                                               hparams.n_ctx_train;
 
-    cparams.cb_eval           = params.cb_eval;
-    cparams.cb_eval_user_data = params.cb_eval_user_data;
+    // 콜백 함수 설정
+    cparams.cb_eval           = params.cb_eval;                       // 평가 콜백 함수
+    cparams.cb_eval_user_data = params.cb_eval_user_data;             // 콜백에 전달할 사용자 데이터
 
+    // RoPE 스케일링 타입 설정
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
-        rope_scaling_type = hparams.rope_scaling_type_train;
+        rope_scaling_type = hparams.rope_scaling_type_train;          // 모델의 훈련 값 사용
     }
 
+    // 스케일링 타입이 NONE이면 스케일링하지 않음 (항상 1.0)
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_NONE) {
-        cparams.rope_freq_scale = 1.0f; // never scale if scaling type is none
+        cparams.rope_freq_scale = 1.0f; // 스케일링 타입이 none이면 절대 스케일링하지 않음
     }
 
-    if (cparams.yarn_ext_factor < 0.0f) { // negative indicates 'not set'
+    // YaRN 확장 계수 설정 (음수는 '설정되지 않음'을 의미)
+    if (cparams.yarn_ext_factor < 0.0f) { 
         cparams.yarn_ext_factor = rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN ? 1.0f : 0.0f;
     }
 
+    // YaRN 어텐션 계수에 모델의 RoPE 어텐션 계수를 곱함
     cparams.yarn_attn_factor *= hparams.rope_attn_factor;
 
+    // 풀링 타입 설정
     if (cparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
         if (hparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
-            cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
+            cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;  // 기본값: 풀링 없음
         } else {
-            cparams.pooling_type = hparams.pooling_type;
+            cparams.pooling_type = hparams.pooling_type;     // 모델의 풀링 타입 사용
         }
     }
 
+    // 인과적(causal) 어텐션 설정 - 텍스트 생성에서는 일반적으로 true
     if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
-        cparams.causal_attn = hparams.causal_attn;
+        cparams.causal_attn = hparams.causal_attn;  // 모델의 값 사용
     } else {
-        cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
+        cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;  // 사용자 지정 값 사용
     }
 
-    // with causal attention, the batch size is limited by the context size
+    // 인과적 어텐션에서는 배치 크기가 컨텍스트 크기로 제한됨
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
-    // the batch has to be at least GGML_KQ_MASK_PAD because we will be padding the KQ_mask
-    // this is required by GPU kernels in order to avoid out-of-bounds accesses (e.g. ggml_flash_attn_ext)
-    // ref: https://github.com/ggerganov/llama.cpp/pull/5021
-    // TODO: this padding is not needed for the cache-less context so we should probably move it to llama_context_kv_self
+    // 배치는 최소 GGML_KQ_MASK_PAD 크기 이상이어야 함
+    // GPU 커널(예: ggml_flash_attn_ext)에서 경계 밖 접근을 방지하기 위함
+    // 참조: https://github.com/ggerganov/llama.cpp/pull/5021
     if (cparams.n_batch < GGML_KQ_MASK_PAD) {
         LLAMA_LOG_WARN("%s: n_batch is less than GGML_KQ_MASK_PAD - increasing to %d\n", __func__, GGML_KQ_MASK_PAD);
         cparams.n_batch = GGML_KQ_MASK_PAD;
     }
 
+    // 마이크로 배치 크기 설정 - 배치를 작은 단위로 나누어 처리
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // 시퀀스당 컨텍스트 크기 계산
     const uint32_t n_ctx_per_seq = cparams.n_ctx / cparams.n_seq_max;
 
+    // 설정된 파라미터 정보 출력
     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_per_seq = %u\n",   __func__, n_ctx_per_seq);
@@ -107,20 +128,24 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
 
+    // 시퀀스당 컨텍스트 크기가 모델의 훈련 컨텍스트 크기보다 작으면 경고
     if (n_ctx_per_seq < hparams.n_ctx_train) {
         LLAMA_LOG_WARN("%s: n_ctx_per_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
                 __func__, n_ctx_per_seq, hparams.n_ctx_train);
     }
 
+    // 시퀀스당 컨텍스트 크기가 모델의 훈련 컨텍스트 크기보다 크면 경고
     if (n_ctx_per_seq > hparams.n_ctx_train) {
         LLAMA_LOG_WARN("%s: n_ctx_pre_seq (%u) > n_ctx_train (%u) -- possible training context overflow\n",
                 __func__, n_ctx_per_seq, hparams.n_ctx_train);
     }
 
+    // 모든 토큰의 로짓(확률 점수) 계산 여부
     logits_all = params.logits_all;
 
+    // 어휘만 로드된 모델이 아닌 경우 백엔드 및 계산 자원 초기화
     if (!hparams.vocab_only) {
-        // GPU backends
+        // GPU 백엔드 초기화
         for (auto * dev : model.devices) {
             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             if (backend == nullptr) {
@@ -129,7 +154,7 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
-        // add ACCEL backends (such as BLAS)
+        // ACCEL 백엔드(예: BLAS) 추가
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
@@ -141,14 +166,14 @@ llama_context::llama_context(
             }
         }
 
-        // add CPU backend
+        // CPU 백엔드 추가
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (backend_cpu == nullptr) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
 
-        // create a list of the set_n_threads functions in the backends
+        // 백엔드에서 set_n_threads 함수 목록 생성 - 스레드 수 설정에 사용
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -160,11 +185,12 @@ llama_context::llama_context(
             }
         }
 
+        // 중단 콜백 설정
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
-        // graph outputs buffer
+        // 그래프 출력 버퍼 초기화
         {
-            // resized during inference when a batch uses more outputs
+            // 추론 중 더 많은 출력을 사용하는 배치가 있을 때 크기 조정
             if ((uint32_t) output_reserve(params.n_seq_max) < params.n_seq_max) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
@@ -175,36 +201,42 @@ llama_context::llama_context(
         }
     }
 
-    // init the memory module
-    // TODO: for now, always create a unified KV cache
+    // 메모리 모듈 초기화
+    // 통합 KV 캐시 생성 (Key-Value 캐시는 어텐션 메커니즘의 계산 효율성을 높이는 중요한 요소)
     if (!hparams.vocab_only) {
         kv_self.reset(static_cast<llama_kv_cache_unified *>(model.create_memory()));
 
         LLAMA_LOG_DEBUG("%s: n_ctx = %u\n", __func__, cparams.n_ctx);
 
+        // 컨텍스트 크기를 KV 캐시 패딩에 맞게 조정
         cparams.n_ctx = GGML_PAD(cparams.n_ctx, kv_self->get_padding(cparams));
 
         LLAMA_LOG_DEBUG("%s: n_ctx = %u (padded)\n", __func__, cparams.n_ctx);
 
+        // KV 캐시 크기와 데이터 타입 설정
         uint32_t kv_size = cparams.n_ctx;
-        ggml_type type_k = params.type_k;
-        ggml_type type_v = params.type_v;
+        ggml_type type_k = params.type_k;  // K(Key) 캐시 데이터 타입
+        ggml_type type_v = params.type_v;  // V(Value) 캐시 데이터 타입
 
+        // 순환 모델(Mamba 등)은 특별한 처리 필요
         if (llama_model_is_recurrent(&model)) {
-            // Mamba needs at least as many KV cells as there are sequences kept at any time
+            // Mamba는 언제든지 유지되는 시퀀스 수만큼의 KV 셀이 필요
             kv_size = std::max((uint32_t) 1, params.n_seq_max);
-            // it's probably best to keep as much precision as possible for the states
-            type_k = GGML_TYPE_F32; // required by ggml_ssm_conv for Mamba's conv_states
-            type_v = GGML_TYPE_F32; // required by ggml_ssm_scan for Mamba's ssm_states
+            // 상태에 대해 가능한 많은 정밀도 유지가 중요
+            type_k = GGML_TYPE_F32; // Mamba의 conv_states에 ggml_ssm_conv가 요구
+            type_v = GGML_TYPE_F32; // Mamba의 ssm_states에 ggml_ssm_scan이 요구
         }
 
+        // 블록 크기 검증
         GGML_ASSERT(hparams.n_embd_head_k % ggml_blck_size(type_k) == 0);
         GGML_ASSERT(hparams.n_embd_head_v % ggml_blck_size(type_v) == 0);
 
+        // KV 캐시 초기화
         if (!kv_self->init(model, cparams, type_k, type_v, kv_size, cparams.offload_kqv)) {
             throw std::runtime_error("failed to initialize self-attention cache");
         }
 
+        // KV 캐시 메모리 사용량 정보 출력
         {
             const size_t memory_size_k = kv_self->size_k_bytes();
             const size_t memory_size_v = kv_self->size_v_bytes();
@@ -216,19 +248,21 @@ llama_context::llama_context(
         }
     }
 
-    // init backends
+    // 백엔드 초기화
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
 
+        // 백엔드 버퍼 타입 및 포인터 초기화
         backend_buft.clear();
         backend_ptrs.clear();
 
+        // 각 백엔드의 기본 버퍼 타입 설정
         for (auto & backend : backends) {
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
+            // CPU 백엔드이고 디바이스가 있는 경우, 중간 상태의 빠른 전송을 위해 첫 번째 디바이스의 호스트 버퍼 사용
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
-                // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 auto * dev = model.devices[0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
                 if (host_buft) {
@@ -242,111 +276,121 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+        // 최대 노드 수 계산 - 계산 그래프의 크기를 결정
         const size_t max_nodes = this->graph_max_nodes();
 
         LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-        // buffer used to store the computation graph and the tensor meta data
+        // 계산 그래프와 텐서 메타데이터를 저장할 버퍼 할당
         buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
-        // TODO: move these checks to ggml_backend_sched
-        // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // 파이프라인 병렬 처리 활성화 여부 결정
+        // 메모리 사용량이 증가하므로 필요한 경우에만 활성화
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.params.n_gpu_layers > (int) model.hparams.n_layer &&
             model.params.split_mode == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv;
 
-        // pipeline parallelism requires support for async compute and events in all devices
+        // 파이프라인 병렬 처리는 모든 디바이스에서 비동기 계산과 이벤트 지원이 필요
         if (pipeline_parallel) {
             for (auto & backend : backends) {
                 auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
                 if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    // ignore CPU backend
+                    // CPU 백엔드는 무시
                     continue;
                 }
                 auto * dev = ggml_backend_get_device(backend.get());
                 ggml_backend_dev_props props;
                 ggml_backend_dev_get_props(dev, &props);
                 if (!props.caps.async || !props.caps.events) {
-                    // device does not support async compute or events
+                    // 디바이스가 비동기 계산이나 이벤트를 지원하지 않음
                     pipeline_parallel = false;
                     break;
                 }
             }
         }
 
+        // 백엔드 스케줄러 생성 - 계산 작업을 여러 백엔드에 분배
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, pipeline_parallel));
 
+        // 파이프라인 병렬 처리 활성화 정보 출력
         if (pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(sched.get()));
         }
     }
 
-    // reserve worst-case graph
+    // 최악의 경우 그래프 예약
     if (!hparams.vocab_only) {
-        const uint32_t n_seqs = 1; // TODO: worst-case number of sequences
+        const uint32_t n_seqs = 1; // TODO: 최악의 경우 시퀀스 수
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-        llama_token token = model.vocab.token_bos(); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
+        // llama_build_graph에서 실제로 사용되지 않지만 토큰 vs 임베딩 입력 그래프 선택에 필요
+        llama_token token = model.vocab.token_bos();
 
-        // restore later
-        // TODO: something cleaner
+        // 나중에 복원할 값 저장
+        // TODO: 더 깔끔한 방식 필요
         const auto n_outputs_save = n_outputs;
 
-        // max number of outputs
+        // 최대 출력 수
         n_outputs = n_tokens;
 
         LLAMA_LOG_DEBUG("%s: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
-        int n_splits_pp = -1;
-        int n_nodes_pp  = -1;
+        int n_splits_pp = -1;  // 병렬 처리(PP) 그래프의 분할 수
+        int n_nodes_pp  = -1;  // 병렬 처리 그래프의 노드 수
 
-        int n_splits_tg = -1;
-        int n_nodes_tg  = -1;
+        int n_splits_tg = -1;  // 토큰 생성(TG) 그래프의 분할 수
+        int n_nodes_tg  = -1;  // 토큰 생성 그래프의 노드 수
 
-        // simulate full KV cache
+        // 전체 KV 캐시 시뮬레이션
         kv_self->n = kv_self->size;
 
         cross.v_embd.clear();
 
-        // reserve pp graph first so that buffers are only allocated once
+        // 버퍼가 한 번만 할당되도록 먼저 병렬 처리 그래프 예약
         {
+            // 병렬 처리를 위한 마이크로 배치 설정
             llama_ubatch ubatch_pp = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
-            auto * gf = graph_init();
-            graph_build(ctx_compute.get(), gf, ubatch_pp, LLM_GRAPH_TYPE_DEFAULT);
+            auto * gf = graph_init();  // 그래프 초기화
+            graph_build(ctx_compute.get(), gf, ubatch_pp, LLM_GRAPH_TYPE_DEFAULT);  // 그래프 구축
             if (!ggml_backend_sched_reserve(sched.get(), gf)) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
 
+            // 분할 수와 노드 수 저장
             n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
             n_nodes_pp  = ggml_graph_n_nodes(gf);
         }
 
-        // reserve with tg graph to get the number of splits and nodes
+        // 토큰 생성 그래프로 분할 수와 노드 수 계산
         {
+            // 토큰 생성을 위한 마이크로 배치 설정 (단일 토큰)
             llama_ubatch ubatch_tg = { true, 1, 1, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
-            auto * gf = graph_init();
-            graph_build(ctx_compute.get(), gf, ubatch_tg, LLM_GRAPH_TYPE_DEFAULT);
+            auto * gf = graph_init();  // 그래프 초기화
+            graph_build(ctx_compute.get(), gf, ubatch_tg, LLM_GRAPH_TYPE_DEFAULT);  // 그래프 구축
             if (!ggml_backend_sched_reserve(sched.get(), gf)) {
                 throw std::runtime_error("failed to allocate compute tg buffers");
             }
+            // 분할 수와 노드 수 저장
             n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
             n_nodes_tg  = ggml_graph_n_nodes(gf);
         }
 
-        // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+        // 추론 중 ggml-alloc 재할당을 방지하기 위해 병렬 처리 그래프로 다시 예약
         {
             llama_ubatch ubatch_pp = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
-            auto * gf = graph_init();
-            graph_build(ctx_compute.get(), gf, ubatch_pp, LLM_GRAPH_TYPE_DEFAULT);
+            auto * gf = graph_init();  // 그래프 초기화
+            graph_build(ctx_compute.get(), gf, ubatch_pp, LLM_GRAPH_TYPE_DEFAULT);  // 그래프 구축
             if (!ggml_backend_sched_reserve(sched.get(), gf)) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
         }
 
+        // 원래 출력 수 복원
         n_outputs = n_outputs_save;
 
+        // 각 백엔드의 계산 버퍼 크기 정보 출력
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -358,12 +402,14 @@ llama_context::llama_context(
             }
         }
 
+        // 그래프 노드 수 정보 출력
         if (n_nodes_pp == n_nodes_tg) {
             LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
         } else {
             LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n", __func__, n_nodes_pp, n_tokens, n_nodes_tg);
         }
 
+        // 그래프 분할 수 정보 출력
         if (n_splits_pp == n_splits_tg) {
             LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
         } else {
@@ -372,107 +418,133 @@ llama_context::llama_context(
     }
 }
 
+// llama_context 소멸자 - 컨텍스트 리소스 해제
 llama_context::~llama_context() = default;
 
+// llama_context에서 모든 계산 작업을 동기화하는 함수
+// 병렬 처리된 모든 작업이 완료될 때까지 대기하고 성능 통계를 업데이트함
 void llama_context::synchronize() {
+    // 스케줄러의 모든 작업이 완료될 때까지 대기
     ggml_backend_sched_synchronize(sched.get());
 
-    // FIXME: if multiple single tokens are evaluated without a synchronization,
-    // the stats will be added to the prompt evaluation stats
-    // this should only happen when using batch size 1 to evaluate a batch
+    // FIXME: 동기화 없이 여러 단일 토큰이 평가되면
+    // 통계가 프롬프트 평가 통계에 추가됨
+    // 이는 배치 크기 1로 배치를 평가할 때만 발생해야 함
 
-    // add the evaluation to the stats
+    // 성능 통계에 평가 시간 추가
     if (n_queued_tokens == 1) {
+        // 단일 토큰 평가 (생성 단계)
         if (!cparams.no_perf) {
-            t_eval_us += ggml_time_us() - t_compute_start_us;
+            t_eval_us += ggml_time_us() - t_compute_start_us; // 평가 시간 누적(마이크로초)
         }
-        n_eval++;
+        n_eval++; // 단일 토큰 평가 횟수 증가
     } else if (n_queued_tokens > 1) {
+        // 다중 토큰 평가 (프롬프트 처리 단계)
         if (!cparams.no_perf) {
-            t_p_eval_us += ggml_time_us() - t_compute_start_us;
+            t_p_eval_us += ggml_time_us() - t_compute_start_us; // 프롬프트 평가 시간 누적(마이크로초)
         }
-        n_p_eval += n_queued_tokens;
+        n_p_eval += n_queued_tokens; // 프롬프트 토큰 평가 횟수 증가
     }
 
-    // get a more accurate load time, upon first eval
+    // 첫 번째 평가 시 로드 시간을 더 정확하게 계산
     if (n_queued_tokens > 0 && !has_evaluated_once) {
-        t_load_us = ggml_time_us() - t_start_us;
+        t_load_us = ggml_time_us() - t_start_us; // 시작부터 첫 평가까지의 총 시간
         has_evaluated_once = true;
     }
 
-    n_queued_tokens = 0;
-    t_compute_start_us = 0;
+    // 상태 초기화
+    n_queued_tokens = 0;      // 대기 중인 토큰 수 초기화
+    t_compute_start_us = 0;   // 계산 시작 시간 초기화
 }
 
+// 모델에 대한 참조를 반환하는 getter 함수
 const llama_model & llama_context::get_model() const {
     return model;
 }
 
+// 컨텍스트 크기를 반환하는 getter 함수
+// 이 값은 KV 캐시의 총 크기(최대 토큰 수)를 결정함
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }
 
+// 시퀀스당 컨텍스트 크기를 반환 (총 컨텍스트 크기 / 최대 시퀀스 수)
+// 멀티 시퀀스 처리(예: 채팅)에서 각 시퀀스에 할당된 컨텍스트 크기
 uint32_t llama_context::n_ctx_per_seq() const {
     return cparams.n_ctx / cparams.n_seq_max;
 }
 
+// 배치 크기를 반환 (한 번에 처리할 수 있는 최대 토큰 수)
 uint32_t llama_context::n_batch() const {
     return cparams.n_batch;
 }
 
+// 마이크로 배치 크기를 반환 (내부적으로 한 번에 처리하는 토큰 수)
 uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
 
+// 최대 시퀀스 수를 반환 (동시에 처리할 수 있는 대화 흐름 수)
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
 
+// 추론에 사용되는 스레드 수를 반환
 uint32_t llama_context::n_threads() const {
     return cparams.n_threads;
 }
 
+// 배치 처리에 사용되는 스레드 수를 반환
 uint32_t llama_context::n_threads_batch() const {
     return cparams.n_threads_batch;
 }
 
+// 자체 KV 캐시 객체에 대한 포인터를 반환 (비상수 버전)
 llama_kv_cache * llama_context::get_kv_self() {
     return kv_self.get();
 }
 
+// 자체 KV 캐시 객체에 대한 포인터를 반환 (상수 버전)
 const llama_kv_cache * llama_context::get_kv_self() const {
     return kv_self.get();
 }
 
+// RoPE(회전 위치 임베딩)를 시프트를 적용하여 구축하는 함수
+// RoPE는 트랜스포머에서 상대적 위치 정보를 인코딩하는 방법
+// KV 캐시 시프트 시 위치 정보를 올바르게 조정하는 데 사용됨
 ggml_tensor * llama_context::build_rope_shift(
-        ggml_context * ctx0,
-        ggml_tensor * cur,
-        ggml_tensor * shift,
-        ggml_tensor * factors,
-              float   freq_base,
-              float   freq_scale,
-        ggml_backend_buffer * bbuf) const {
-    const auto & n_ctx_orig = cparams.n_ctx_orig_yarn;
+        ggml_context * ctx0,         // GGML 컨텍스트
+        ggml_tensor * cur,           // 입력 텐서 (일반적으로 키(K) 텐서)
+        ggml_tensor * shift,         // 시프트 값 텐서 (각 위치의 델타 값)
+        ggml_tensor * factors,       // RoPE 계수 텐서
+              float   freq_base,     // 기본 주파수
+              float   freq_scale,    // 주파수 스케일링 계수
+        ggml_backend_buffer * bbuf) const { // 백엔드 버퍼
+    // YaRN(Yet another RoPe extensioN) 관련 파라미터
+    const auto & n_ctx_orig = cparams.n_ctx_orig_yarn;    // 원본 컨텍스트 크기
 
-    const auto & yarn_ext_factor  = cparams.yarn_ext_factor;
-    const auto & yarn_attn_factor = cparams.yarn_attn_factor;
-    const auto & yarn_beta_fast   = cparams.yarn_beta_fast;
-    const auto & yarn_beta_slow   = cparams.yarn_beta_slow;
+    const auto & yarn_ext_factor  = cparams.yarn_ext_factor;  // YaRN 확장 계수
+    const auto & yarn_attn_factor = cparams.yarn_attn_factor; // YaRN 어텐션 계수
+    const auto & yarn_beta_fast   = cparams.yarn_beta_fast;   // YaRN 빠른 베타 계수
+    const auto & yarn_beta_slow   = cparams.yarn_beta_slow;   // YaRN 느린 베타 계수
 
+    // 모델 하이퍼파라미터
     const auto & hparams = model.hparams;
 
-    const auto & n_rot     = hparams.n_rot;
-    const auto & rope_type = hparams.rope_type;
+    const auto & n_rot     = hparams.n_rot;     // 회전시킬 차원 수
+    const auto & rope_type = hparams.rope_type; // RoPE 유형
 
     ggml_tensor * tmp;
 
+    // 양자화된 텐서인 경우 특별 처리
     if (ggml_is_quantized(cur->type)) {
-        // dequantize to f32 -> RoPE -> quantize back
+        // 양자화 텐서를 f32로 변환 -> RoPE 적용 -> 다시 양자화
         tmp = ggml_cast(ctx0, cur, GGML_TYPE_F32);
 
+        // 백엔드 버퍼가 존재하면 적절한 백엔드 설정
         if (bbuf) {
             for (const auto & backend : backends) {
-                // Figure out which backend KV cache belongs to
+                // KV 캐시가 속한 백엔드 찾기
                 if (ggml_backend_supports_buft(backend.get(), ggml_backend_buffer_get_type(bbuf))) {
                     ggml_backend_sched_set_tensor_backend(sched.get(), tmp, backend.get());
                     break;
@@ -480,103 +552,140 @@ ggml_tensor * llama_context::build_rope_shift(
             }
         }
 
+        // RoPE 확장 적용 (제자리 연산)
         tmp = ggml_rope_ext_inplace(ctx0, tmp,
                 shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
 
+        // 결과를 원래 텐서로 복사 (양자화 형식 유지)
         tmp = ggml_cpy(ctx0, tmp, cur);
     } else {
-        // we rotate only the first n_rot dimensions
+        // 비양자화 텐서는 직접 RoPE 적용
+        // 처음 n_rot 차원에만 회전 적용
         tmp = ggml_rope_ext_inplace(ctx0, cur,
                 shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
     }
 
-    return tmp;
+    return tmp; // 처리된 텐서 반환
 }
 
+// KV 캐시 시프트 입력을 처리하는 클래스
+// 계산 그래프에 시프트 정보를 전달하는 역할
 class llm_graph_input_k_shift : public llm_graph_input_i {
 public:
+    // 생성자: KV 캐시에 대한 참조 저장
     llm_graph_input_k_shift(const llama_kv_cache_unified * kv_self) : kv_self(kv_self) {}
     virtual ~llm_graph_input_k_shift() = default;
 
+    // 입력 설정 메서드 (llm_graph_input_i 인터페이스 구현)
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * k_shift; // I32 [kv_size]
+    ggml_tensor * k_shift; // [kv_size] 크기의 I32 타입 시프트 값 텐서
 
+    // KV 캐시에 대한 참조
     const llama_kv_cache_unified * kv_self;
 };
 
+// 시프트 입력 설정 함수 구현
 void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
+    GGML_UNUSED(ubatch); // 사용하지 않는 매개변수
 
+    // k_shift 텐서가 존재하면 데이터 설정
     if (k_shift) {
+        // 호스트 메모리에 있는지 확인 (CPU 메모리)
         assert(ggml_backend_buffer_is_host(k_shift->buffer));
 
+        // 텐서 데이터 포인터
         int32_t * data = (int32_t *) k_shift->data;
 
+        // 각 KV 셀의 델타 값을 시프트 텐서에 복사
         for (uint32_t i = 0; i < kv_self->size; ++i) {
             data[i] = kv_self->cells[i].delta;
         }
     }
 }
 
+// KV 캐시 시프트를 위한 계산 그래프를 구축하는 함수
+// KV 캐시의 위치가 변경되었을 때 RoPE 위치 정보를 업데이트하는 데 사용
 llm_graph_result_ptr llama_context::build_kv_self_shift(
-        ggml_context * ctx0,
-        ggml_cgraph * gf) const {
+        ggml_context * ctx0,  // GGML 컨텍스트
+        ggml_cgraph * gf) const {  // 계산 그래프
+    // 결과 객체 생성
     auto res = std::make_unique<llm_graph_result>();
 
+    // 모델 하이퍼파라미터
     const auto & hparams = model.hparams;
 
+    // 레이어 수
     const auto & n_layer = hparams.n_layer;
 
+    // 헤드당 키 임베딩 크기
     const auto & n_embd_head_k = hparams.n_embd_head_k;
-  //const auto & n_embd_head_v = hparams.n_embd_head_v;
+    // 헤드당 값 임베딩 크기 (사용하지 않음)
+    //const auto & n_embd_head_v = hparams.n_embd_head_v;
 
+    // KV 캐시 크기와 컨텍스트 크기가 같은지 확인 (현재 비활성화됨)
     //GGML_ASSERT(kv_self->size == n_ctx);
 
+    // KV 시프트 입력 객체 생성
     auto inp = std::make_unique<llm_graph_input_k_shift>(kv_self.get());
 
+    // 시프트 값을 저장할 텐서 생성 (I32 타입, 컨텍스트 크기)
     inp->k_shift = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, cparams.n_ctx);
-    ggml_set_input(inp->k_shift);
+    ggml_set_input(inp->k_shift); // 입력 텐서로 표시
 
+    // 각 레이어에 대해 시프트 처리
     for (uint32_t il = 0; il < n_layer; ++il) {
+        // KV 헤드 수 및 GQA(Grouped Query Attention)에서의 키 임베딩 크기
         const int64_t n_head_kv    = hparams.n_head_kv(il);
         const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
+        // 슬라이딩 윈도우 어텐션(SWA) 사용 여부
         const bool is_swa = hparams.is_swa(il);
 
-        // note: the swa rope params could become part of the cparams in the future
-        //       if we decide to make them configurable, like the non-sliding ones
+        // 레이어별 RoPE 주파수 파라미터 설정
+        // SWA 사용 시 모델의 훈련 값 사용, 그렇지 않으면 컨텍스트 파라미터 사용
         const float freq_base_l  = is_swa ? hparams.rope_freq_base_train_swa  : cparams.rope_freq_base;
         const float freq_scale_l = is_swa ? hparams.rope_freq_scale_train_swa : cparams.rope_freq_scale;
 
+        // RoPE 계수 텐서 가져오기
         ggml_tensor * rope_factors = kv_self->cbs.get_rope_factors(n_ctx_per_seq(), il);
 
+        // 키(K) 텐서에 대한 뷰 생성 (3D 텐서로 해석)
+        // 형태: [n_embd_head_k, n_head_kv, kv_self->size]
         ggml_tensor * k =
             ggml_view_3d(ctx0, kv_self->k_l[il],
                 n_embd_head_k, n_head_kv, kv_self->size,
-                ggml_row_size(kv_self->k_l[il]->type, n_embd_head_k),
-                ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
-                0);
+                ggml_row_size(kv_self->k_l[il]->type, n_embd_head_k), // 행 크기
+                ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),  // 행 크기(GQA)
+                0);  // 오프셋 0
 
+        // RoPE 시프트 적용
         ggml_tensor * cur = build_rope_shift(ctx0, k, inp->k_shift, rope_factors, freq_base_l, freq_scale_l, kv_self->k_l[il]->buffer);
 
+        // 계산 그래프에 연산 추가
         ggml_build_forward_expand(gf, cur);
     }
 
+    // 결과 객체에 입력 추가
     res->add_input(std::move(inp));
 
-    return res;
+    return res; // 구축된 그래프 결과 반환
 }
 
+// KV 캐시 조각 모음을 위한 계산 그래프를 구축하는 함수
+// 캐시에서 사용되지 않는 공간을 정리하고 효율적으로 재구성
 llm_graph_result_ptr llama_context::build_kv_self_defrag(
-        ggml_context * ctx0,
-        ggml_cgraph * gf) const {
+        ggml_context * ctx0,  // GGML 컨텍스트
+        ggml_cgraph * gf) const {  // 계산 그래프
+    // 결과 객체 생성
     auto res = std::make_unique<llm_graph_result>();
 
+    // 모델 하이퍼파라미터
     const auto & hparams = model.hparams;
 
+    // 조각 모음할 셀 ID 목록
     const auto & ids = kv_self->defrag_info.ids;
 
 #if 0
@@ -650,372 +759,489 @@ llm_graph_result_ptr llama_context::build_kv_self_defrag(
         ggml_backend_tensor_set(v_l[il], buf_v.data(), 0, buf_v.size());
     }
 #else
+    // 활성화된 코드 블록 - GGML 그래프 기반 조각 모음 구현
+    // 각 셀을 순회하며 필요한 이동 작업 찾기
     for (uint32_t i = 0; i < ids.size(); ++i) {
-        const uint32_t id = ids[i];
+        const uint32_t id = ids[i];  // 대상 인덱스
 
+        // 이동이 필요 없는 경우(이미 올바른 위치 또는 유효하지 않은 ID) 건너뜀
         if (i == id || id == ids.size()) {
             continue;
         }
 
-        uint32_t nm = 1;
+        uint32_t nm = 1;  // 연속적으로 이동할 셀 수
 
+        // 연속적인 셀 그룹 찾기 (최적화를 위해 일괄 처리)
         while (i + nm < ids.size() && ids[i + nm] == id + nm) {
             nm++;
         }
 
+        // 각 레이어에 대해 처리
         for (uint32_t il = 0; il < hparams.n_layer; ++il) { // NOLINT
-            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-            const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+            // 레이어별 키(K)와 값(V)의 임베딩 크기 계산
+            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);  // GQA에서의 키 임베딩 크기
+            const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);  // GQA에서의 값 임베딩 크기
 
+            // 원본 키(K) 텐서의 일부에 대한 뷰 생성 (2D 텐서: [n_embd_k_gqa, nm])
             ggml_tensor * view_k_src = ggml_view_2d(ctx0, kv_self->k_l[il],
-                    n_embd_k_gqa, nm,
-                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
-                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*i));
+                    n_embd_k_gqa, nm,  // 차원 크기
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),  // 행 크기
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*i));  // 시작 오프셋
 
+            // 대상 키(K) 텐서의 일부에 대한 뷰 생성
             ggml_tensor * view_k_dst = ggml_view_2d(ctx0, kv_self->k_l[il],
-                    n_embd_k_gqa, nm,
-                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
-                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*id));
+                    n_embd_k_gqa, nm,  // 차원 크기
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),  // 행 크기
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*id));  // 시작 오프셋
 
-            ggml_tensor * view_v_src;
-            ggml_tensor * view_v_dst;
+            ggml_tensor * view_v_src;  // 원본 값(V) 텐서 뷰
+            ggml_tensor * view_v_dst;  // 대상 값(V) 텐서 뷰
 
+            // Flash Attention 사용 여부에 따라 V 캐시 레이아웃이 다름
             if (cparams.flash_attn) {
-                // NOTE: the V cache is not transposed when using flash attention
+                // Flash Attention 사용 시 V 캐시는 전치되지 않음
                 view_v_src = ggml_view_2d(ctx0, kv_self->v_l[il],
-                        n_embd_v_gqa, nm,
-                        ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa),
-                        ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa*i));
+                        n_embd_v_gqa, nm,  // 차원 크기 [n_embd_v_gqa, nm]
+                        ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa),  // 행 크기
+                        ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa*i));  // 시작 오프셋
 
                 view_v_dst = ggml_view_2d(ctx0, kv_self->v_l[il],
-                        n_embd_v_gqa, nm,
-                        ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa),
-                        ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa*id));
+                        n_embd_v_gqa, nm,  // 차원 크기
+                        ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa),  // 행 크기
+                        ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa*id));  // 시작 오프셋
             } else {
+                // 일반 모드에서 V 캐시는 전치됨 (차원 순서 변경됨)
                 view_v_src = ggml_view_2d(ctx0, kv_self->v_l[il],
-                        nm, n_embd_v_gqa,
-                        ggml_row_size(kv_self->v_l[il]->type, kv_self->size),
-                        ggml_row_size(kv_self->v_l[il]->type, i));
+                        nm, n_embd_v_gqa,  // 차원 크기 [nm, n_embd_v_gqa]
+                        ggml_row_size(kv_self->v_l[il]->type, kv_self->size),  // 행 크기
+                        ggml_row_size(kv_self->v_l[il]->type, i));  // 시작 오프셋
 
                 view_v_dst = ggml_view_2d(ctx0, kv_self->v_l[il],
-                        nm, n_embd_v_gqa,
-                        ggml_row_size(kv_self->v_l[il]->type, kv_self->size),
-                        ggml_row_size(kv_self->v_l[il]->type, id));
+                        nm, n_embd_v_gqa,  // 차원 크기
+                        ggml_row_size(kv_self->v_l[il]->type, kv_self->size),  // 행 크기
+                        ggml_row_size(kv_self->v_l[il]->type, id));  // 시작 오프셋
             }
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
+            // 계산 그래프에 복사 연산 추가
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));  // K 복사
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));  // V 복사
         }
 
+        // 이미 처리된 셀 건너뛰기
         i += nm - 1;
-    }
+    } 
 
+    // 디버깅용 로그 (비활성화)
     //LLAMA_LOG_INFO("gf->n_nodes = %d\n", gf->n_nodes);
 #endif
 
-    return res;
+    return res;  // 결과 객체 반환
 }
 
+// KV 캐시 업데이트 함수 - 시프트 및 조각 모음 적용
 void llama_context::kv_self_update() {
-    auto & kv = kv_self;
+    auto & kv = kv_self;  // KV 캐시 참조
 
-    bool need_reserve = false;
+    bool need_reserve = false;  // 최악의 경우 그래프 예약 필요 여부
 
+    // 시프트가 필요한 경우
     if (kv->has_shift) {
+        // 시프트 기능 지원 확인
         if (!kv->get_can_shift()) {
-            GGML_ABORT("The current context does not support K-shift");
+            GGML_ABORT("The current context does not support K-shift");  // 지원하지 않으면 중단
         }
 
-        LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);
+        LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);  // 디버그 로그
 
-        // apply K-shift if needed
+        // RoPE 유형이 NONE이 아닌 경우에만 K-시프트 적용
         if (model.hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
-            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_reset(sched.get());  // 스케줄러 초기화
 
-            auto * gf = graph_init();
+            auto * gf = graph_init();  // 새 계산 그래프 초기화
 
+            // KV 시프트를 위한 그래프 구축
             auto res = build_kv_self_shift(ctx_compute.get(), gf);
 
+            // 그래프를 위한 메모리 할당
             ggml_backend_sched_alloc_graph(sched.get(), gf);
 
+            // 입력 설정
             res->set_inputs(nullptr);
 
+            // 그래프 계산 실행 (동기화 없이)
             graph_compute(gf, false);
 
-            need_reserve = true;
+            need_reserve = true;  // 리소스 예약 필요 표시
         }
 
+        // 시프트 상태 초기화
         {
-            kv->has_shift = false;
+            kv->has_shift = false;  // 시프트 완료 표시
 
+            // 모든 셀의 델타 값 초기화
             for (uint32_t i = 0; i < kv->size; ++i) {
                 kv->cells[i].delta = 0;
             }
         }
     }
 
-    // defragment the KV cache if needed
+    // KV 캐시 조각 모음이 필요한 경우
     if (kv->do_defrag) {
-        LLAMA_LOG_DEBUG("%s: defragmenting KV cache\n", __func__);
+        LLAMA_LOG_DEBUG("%s: defragmenting KV cache\n", __func__);  // 디버그 로그
 
+        // 조각 모음 준비 (그래프 노드 수 제한 확인)
         if (kv->defrag_prepare(graph_max_nodes())) {
-            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_reset(sched.get());  // 스케줄러 초기화
 
-            auto * gf = graph_init();
+            auto * gf = graph_init();  // 새 계산 그래프 초기화
 
+            // 조각 모음을 위한 그래프 구축
             auto res = build_kv_self_defrag(ctx_compute.get(), gf);
 
+            // 그래프를 위한 메모리 할당
             ggml_backend_sched_alloc_graph(sched.get(), gf);
 
+            // 입력 설정
             res->set_inputs(nullptr);
 
+            // 그래프 계산 실행 (동기화 없이)
             graph_compute(gf, false);
 
-            need_reserve = true;
+            need_reserve = true;  // 리소스 예약 필요 표시
         }
 
-        kv->do_defrag = false;
+        kv->do_defrag = false;  // 조각 모음 완료 표시
     }
 
-    // reserve a worst case graph if needed
+    // 필요한 경우 최악의 경우 그래프 예약
     if (need_reserve) {
-        LLAMA_LOG_DEBUG("%s: reserving a worst case graph\n", __func__);
+        LLAMA_LOG_DEBUG("%s: reserving a worst case graph\n", __func__);  // 디버그 로그
 
-        // build worst-case graph
-        uint32_t n_seqs = 1; // TODO: worst-case number of sequences
-        uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        // 최악의 경우 그래프 구축 매개변수
+        uint32_t n_seqs = 1;  // TODO: 최악의 경우 시퀀스 수
+        uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);  // 토큰 수 (컨텍스트 크기와 마이크로 배치 크기 중 작은 값)
 
-        // simulate full KV cache
-        kv_self->n = kv_self->size;
+        // 전체 KV 캐시 시뮬레이션
+        kv_self->n = kv_self->size;  // KV 캐시가 가득 찬 것으로 가정
 
-        llama_token token = model.vocab.token_bos(); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
+        // 입력 토큰 (실제로 사용되지 않지만 토큰과 임베딩 입력 그래프 중 선택하는 데 필요)
+        llama_token token = model.vocab.token_bos();
+        // 마이크로 배치 구성
         llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
 
+        // 그래프 초기화 및 구축
         auto * gf = graph_init();
         graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_DEFAULT);
 
-        // initialize scheduler with the worst-case graph
+        // 최악의 경우 그래프로 스케줄러 초기화
         ggml_backend_sched_reset(sched.get());
         if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);  // 버퍼 할당 실패 로그
         }
     }
 }
 
+// 풀링 타입을 반환하는 getter 함수
+// 임베딩 결과를 풀링하는 방식 결정 (none, mean, cls 등)
 enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+// 로짓(logits) 배열에 대한 포인터 반환 (모든 토큰에 대한 확률 점수)
 float * llama_context::get_logits() {
-    // reorder logits for backward compatibility
+    // 로짓 재정렬 (역방향 호환성을 위해)
     output_reorder();
 
-    return logits;
+    return logits;  // 로짓 배열 포인터 반환
 }
 
+// 특정 인덱스의 로짓 배열에 대한 포인터 반환
 float * llama_context::get_logits_ith(int32_t i) {
-    int32_t j = -1;
+    int32_t j = -1;  // 실제 출력 배열 인덱스
 
     try {
+        // 로짓 배열이 없으면 예외 발생
         if (logits == nullptr) {
             throw std::runtime_error("no logits");
         }
 
+        // 음수 인덱스 처리 (파이썬 스타일 뒤에서부터 접근)
         if (i < 0) {
-            j = n_outputs + i;
+            j = n_outputs + i;  // 뒤에서부터 접근
             if (j < 0) {
                 throw std::runtime_error(format("negative index out of range [0, %d)", n_outputs));
             }
-        } else if ((size_t) i >= output_ids.size()) {
+        } 
+        // 범위 검사
+        else if ((size_t) i >= output_ids.size()) {
             throw std::runtime_error(format("out of range [0, %zu)", output_ids.size()));
-        } else {
+        } 
+        // 양수 인덱스는 출력 ID 배열에서 실제 인덱스 조회
+        else {
             j = output_ids[i];
         }
 
+        // 유효한 로짓 인덱스인지 확인
         if (j < 0) {
             throw std::runtime_error(format("batch.logits[%d] != true", i));
         }
+        // 출력 범위 내인지 확인
         if (j >= n_outputs) {
-            // This should not happen
+            // 이 경우는 발생하지 않아야 함 (내부 오류)
             throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, n_outputs));
         }
 
+        // 해당 인덱스의 로짓 포인터 반환 (각 토큰의 확률 점수)
         return logits + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
+        // 오류 발생 시 로그 출력
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
+        // 디버그 모드에서는 즉시 중단
         GGML_ABORT("fatal error");
 #else
+        // 릴리스 모드에서는 NULL 반환
         return nullptr;
 #endif
     }
 }
 
+// 임베딩 배열에 대한 포인터 반환 (토큰의 벡터 표현)
 float * llama_context::get_embeddings() {
-    // reorder embeddings for backward compatibility
+    // 임베딩 재정렬 (역방향 호환성을 위해)
     output_reorder();
 
-    return embd;
+    return embd;  // 임베딩 배열 포인터 반환
 }
 
+// 특정 인덱스의 임베딩 배열에 대한 포인터 반환
 float * llama_context::get_embeddings_ith(int32_t i) {
-    int32_t j = -1;
+    int32_t j = -1;  // 실제 출력 배열 인덱스
 
     try {
+        // 임베딩 배열이 없으면 예외 발생
         if (embd == nullptr) {
             throw std::runtime_error("no embeddings");
         }
 
+        // 음수 인덱스 처리 (파이썬 스타일 뒤에서부터 접근)
         if (i < 0) {
-            j = n_outputs + i;
+            j = n_outputs + i;  // 뒤에서부터 접근
             if (j < 0) {
                 throw std::runtime_error(format("negative index out of range [0, %d)", n_outputs));
             }
-        } else if ((size_t) i >= output_ids.size()) {
+        } 
+        // 범위 검사
+        else if ((size_t) i >= output_ids.size()) {
             throw std::runtime_error(format("out of range [0, %zu)", output_ids.size()));
-        } else {
+        } 
+        // 양수 인덱스는 출력 ID 배열에서 실제 인덱스 조회
+        else {
             j = output_ids[i];
         }
 
+        // 유효한 임베딩 인덱스인지 확인
         if (j < 0) {
             throw std::runtime_error(format("batch.logits[%d] != true", i));
         }
+        // 출력 범위 내인지 확인
         if (j >= n_outputs) {
-            // This should not happen
+            // 이 경우는 발생하지 않아야 함 (내부 오류)
             throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, n_outputs));
         }
 
+        // 해당 인덱스의 임베딩 포인터 반환 (각 토큰의 벡터 표현)
         return embd + j*model.hparams.n_embd;
     } catch (const std::exception & err) {
+        // 오류 발생 시 로그 출력
         LLAMA_LOG_ERROR("%s: invalid embeddings id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
+        // 디버그 모드에서는 즉시 중단
         GGML_ABORT("fatal error");
 #else
+        // 릴리스 모드에서는 NULL 반환
         return nullptr;
 #endif
     }
 }
 
+// 특정 시퀀스 ID에 대한 임베딩 벡터를 반환하는 함수
+// 시퀀스 ID를 기반으로 해당 시퀀스의 임베딩을 조회
 float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
+    // embd_seq 맵에서 주어진 시퀀스 ID를 찾음
     auto it = embd_seq.find(seq_id);
+    
+    // 시퀀스 ID가 존재하지 않으면 nullptr 반환
     if (it == embd_seq.end()) {
         return nullptr;
     }
 
+    // 해당 시퀀스의 임베딩 벡터 데이터 포인터 반환
     return it->second.data();
 }
 
+// 스레드풀을 컨텍스트에 연결하는 함수
+// 병렬 계산을 위한 외부 스레드풀 설정
 void llama_context::attach_threadpool(
-           ggml_threadpool_t threadpool,
-           ggml_threadpool_t threadpool_batch) {
-    LLAMA_LOG_DEBUG("%s: call\n", __func__);
+           ggml_threadpool_t threadpool,        // 주 연산용 스레드풀
+           ggml_threadpool_t threadpool_batch) { // 배치 처리용 스레드풀 (선택적)
+    LLAMA_LOG_DEBUG("%s: call\n", __func__);    // 디버그 로그 출력
 
-    this->threadpool       = threadpool;
+    // 주 연산용 스레드풀 설정
+    this->threadpool = threadpool;
+    
+    // 배치 처리용 스레드풀 설정 (제공되지 않았으면 주 스레드풀 사용)
     this->threadpool_batch = threadpool_batch ? threadpool_batch : threadpool;
 }
 
+// 스레드풀 연결 해제 함수
+// 컨텍스트에서 스레드풀 참조를 제거
 void llama_context::detach_threadpool() {
-    LLAMA_LOG_DEBUG("%s: call\n", __func__);
+    LLAMA_LOG_DEBUG("%s: call\n", __func__);    // 디버그 로그 출력
 
+    // 스레드풀 참조 제거
     this->threadpool       = nullptr;
     this->threadpool_batch = nullptr;
 }
 
+// 스레드 수 설정 함수
+// 계산에 사용할 스레드 수를 지정
 void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
-    LLAMA_LOG_DEBUG("%s: n_threads = %d, n_threads_batch = %d\n", __func__, n_threads, n_threads_batch);
+    LLAMA_LOG_DEBUG("%s: n_threads = %d, n_threads_batch = %d\n", __func__, n_threads, n_threads_batch);    // 디버그 로그 출력
 
-    cparams.n_threads       = n_threads;
-    cparams.n_threads_batch = n_threads_batch;
+    // 컨텍스트 매개변수에 스레드 수 저장
+    cparams.n_threads       = n_threads;       // 주 연산용 스레드 수
+    cparams.n_threads_batch = n_threads_batch; // 배치 처리용 스레드 수
 }
 
+// 중단 콜백 설정 함수
+// 계산 중 중단 가능성을 제공하는 콜백 함수 설정
 void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
-    LLAMA_LOG_DEBUG("%s: call\n", __func__);
+    LLAMA_LOG_DEBUG("%s: call\n", __func__);    // 디버그 로그 출력
 
+    // 중단 콜백 함수와 관련 데이터 저장
     this->abort_callback      = abort_callback;
     this->abort_callback_data = abort_callback_data;
 
+    // 모든 백엔드에 중단 콜백 전파
     for (auto & backend : backends) {
+        // 백엔드 레지스트리 얻기
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+        
+        // 중단 콜백 설정 함수 포인터 얻기
         auto * set_abort_callback_fn = (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
+        
+        // 함수가 존재하면 백엔드에 콜백 설정
         if (set_abort_callback_fn) {
             set_abort_callback_fn(backend.get(), this->abort_callback, this->abort_callback_data);
         }
     }
 }
 
+// 임베딩 모드 설정 함수
+// 토큰 임베딩 계산 여부 설정
 void llama_context::set_embeddings(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);    // 디버그 로그 출력
 
+    // 임베딩 계산 여부 설정
     cparams.embeddings = value;
 }
 
+// 인과적 어텐션(causal attention) 설정 함수
+// 인과적 어텐션 사용 여부 설정 (미래 토큰을 보지 않는 마스킹)
 void llama_context::set_causal_attn(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);    // 디버그 로그 출력
 
+    // 인과적 어텐션 사용 여부 설정
     cparams.causal_attn = value;
 }
 
+// 웜업 모드 설정 함수
+// 모델 웜업 여부 설정 (첫 실행 시 성능 최적화)
 void llama_context::set_warmup(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);    // 디버그 로그 출력
 
+    // 웜업 모드 설정
     cparams.warmup = value;
 }
 
+// LoRA 어댑터 설정 함수
+// 저차원 랭크 적응(Low-Rank Adaptation) 어댑터 추가 및 스케일 설정
 void llama_context::set_adapter_lora(
-            llama_adapter_lora * adapter,
-            float scale) {
-    LLAMA_LOG_DEBUG("%s: adapter = %p, scale = %f\n", __func__, (void *) adapter, scale);
+            llama_adapter_lora * adapter,  // LoRA 어댑터 포인터
+            float scale) {                // 적용할 스케일(가중치)
+    LLAMA_LOG_DEBUG("%s: adapter = %p, scale = %f\n", __func__, (void *) adapter, scale);    // 디버그 로그 출력
 
+    // LoRA 어댑터와 스케일을 맵에 저장
     loras[adapter] = scale;
 }
 
+// LoRA 어댑터 제거 함수
+// 특정 LoRA 어댑터를 컨텍스트에서 제거
 bool llama_context::rm_adapter_lora(
-            llama_adapter_lora * adapter) {
-    LLAMA_LOG_DEBUG("%s: adapter = %p\n", __func__, (void *) adapter);
+            llama_adapter_lora * adapter) {  // 제거할 LoRA 어댑터 포인터
+    LLAMA_LOG_DEBUG("%s: adapter = %p\n", __func__, (void *) adapter);    // 디버그 로그 출력
 
+    // 어댑터 맵에서 검색
     auto pos = loras.find(adapter);
+    
+    // 어댑터가 존재하면 제거하고 true 반환
     if (pos != loras.end()) {
         loras.erase(pos);
         return true;
     }
 
+    // 어댑터가 없으면 false 반환
     return false;
 }
 
+// 모든 LoRA 어댑터 제거 함수
+// 컨텍스트에 등록된 모든 LoRA 어댑터 초기화
 void llama_context::clear_adapter_lora() {
-    LLAMA_LOG_DEBUG("%s: call\n", __func__);
+    LLAMA_LOG_DEBUG("%s: call\n", __func__);    // 디버그 로그 출력
 
+    // LoRA 어댑터 맵 초기화
     loras.clear();
 }
 
+// 어댑터 컨트롤 벡터 적용 함수
+// 특정 레이어 범위에 컨트롤 벡터 적용 (모델 제어)
 bool llama_context::apply_adapter_cvec(
-            const float * data,
-                 size_t   len,
-                int32_t   n_embd,
-                int32_t   il_start,
-                int32_t   il_end) {
-    LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
+            const float * data,    // 컨트롤 벡터 데이터
+                 size_t   len,     // 데이터 길이
+                int32_t   n_embd,  // 임베딩 차원 수
+                int32_t   il_start,// 시작 레이어 인덱스
+                int32_t   il_end) {// 종료 레이어 인덱스
+    LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);    // 디버그 로그 출력
 
+    // 컨트롤 벡터 적용 후 성공 여부 반환
     return cvec.apply(model, data, len, n_embd, il_start, il_end);
 }
 
+// 토큰 인코딩 함수
+// 입력 토큰 배치를 인코딩하여 임베딩 생성
 int llama_context::encode(llama_batch & inp_batch) {
+    // 입력 토큰이 없으면 오류 반환
     if (inp_batch.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
 
-    // temporary allocate memory for the input batch if needed
-    // TODO: this is incorrect for multiple sequences because pos_max() is the maximum across all sequences
+    // 필요한 경우 입력 배치용 임시 메모리 할당
+    // TODO: 다중 시퀀스의 경우 pos_max()가 모든 시퀀스 중 최대값이므로 부정확할 수 있음
     llama_batch_allocr batch_allocr(inp_batch, inp_batch.pos ? -1 : kv_self->pos_max() + 1);
 
+    // 할당된 배치 참조
     const llama_batch & batch = batch_allocr.batch;
-    const int32_t n_tokens = batch.n_tokens;
+    const int32_t n_tokens = batch.n_tokens;  // 총 토큰 수
 
+    // 모델 하이퍼파라미터 참조
     const auto & hparams = model.hparams;
 
+    // 토큰과 임베딩이 둘 다 있거나 둘 다 없으면 안 됨 (둘 중 하나만 제공해야 함)
     GGML_ASSERT((!batch.token && batch.embd) || (batch.token && !batch.embd)); // NOLINT
 
+    // 토큰 ID가 제공된 경우 유효한 범위인지 검사
     if (batch.token) {
         for (int32_t i = 0; i < n_tokens; ++i) {
             if (batch.token[i] < 0 || (uint32_t) batch.token[i] >= model.vocab.n_tokens()) {
@@ -1025,121 +1251,150 @@ int llama_context::encode(llama_batch & inp_batch) {
         }
     }
 
-    // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
+    // 비인과적 인코딩은 마이크로 배칭이 불가능하므로 배치를 한 번에 처리
+    // 인코더는 n_ubatch가 n_tokens 이상이어야 함
     GGML_ASSERT(cparams.n_ubatch >= (uint32_t) n_tokens && "encoder requires n_ubatch >= n_tokens");
 
+    // 계산 시작 시간 기록 (아직 기록되지 않은 경우)
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
 
+    // 대기 중인 토큰 수 증가
     n_queued_tokens += n_tokens;
 
+    // 임베딩 차원 수
     const int64_t n_embd = hparams.n_embd;
 
+    // 배치를 단순 분할 형태의 sbatch로 변환 (모든 토큰에 대해 로짓 계산)
     sbatch.from_batch(batch, n_embd, /* simple_split */ true, /* logits_all */ true);
 
+    // 단순 분할 마이크로 배치 생성
     const llama_ubatch ubatch = sbatch.split_simple(n_tokens);
 
-    // reserve output buffer
+    // 출력 버퍼 예약
     if (output_reserve(n_tokens) < n_tokens) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
-        return -2;
+        return -2;  // 메모리 할당 실패
     };
 
+    // 출력 ID 매핑 설정 (순차적으로)
     for (int32_t i = 0; i < n_tokens; ++i) {
         output_ids[i] = i;
     }
 
+    // 출력 수 설정
     n_outputs = n_tokens;
 
+    // 배치 매니저 준비 (주석 처리됨)
     //batch_manager->prepare(ubatch);
 
+    // 스케줄러 초기화 및 평가 콜백 설정
     ggml_backend_sched_reset(sched.get());
     ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+    // 계산 그래프 초기화
     auto * gf = graph_init();
+    
+    // 인코더 타입의 계산 그래프 구축
     auto res = graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_ENCODER);
 
+    // 그래프에 메모리 할당
     ggml_backend_sched_alloc_graph(sched.get(), gf);
 
+    // 입력 설정
     res->set_inputs(&ubatch);
 
+    // 그래프 계산 실행 (여러 토큰이면 병렬 처리)
     const auto compute_status = graph_compute(gf, n_tokens > 1);
+    
+    // 계산 상태에 따른 처리
     switch (compute_status) {
         case GGML_STATUS_SUCCESS:
-            break;
+            break;  // 성공적으로 계산 완료
         case GGML_STATUS_ABORTED:
-            return 2;
+            return 2;  // 사용자에 의해 중단됨
         case GGML_STATUS_ALLOC_FAILED:
-            return -2;
+            return -2;  // 메모리 할당 실패
         case GGML_STATUS_FAILED:
         default:
-            return -3;
+            return -3;  // 기타 실패
     }
 
+    // 임베딩 텐서 (풀링된 임베딩이 있으면 사용, 없으면 일반 임베딩 사용)
     auto * t_embd = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
 
-    // extract embeddings
+    // 임베딩 추출
     if (t_embd) {
+        // 임베딩 텐서의 백엔드 가져오기
         ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
         GGML_ASSERT(backend_embd != nullptr);
 
         GGML_ASSERT(embd != nullptr);
 
+        // 풀링 타입에 따라 다른 방식으로 임베딩 처리
         switch (cparams.pooling_type) {
             case LLAMA_POOLING_TYPE_NONE:
                 {
-                    // extract token embeddings
+                    // 토큰별 임베딩 추출
                     GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_size);
                     ggml_backend_tensor_get_async(backend_embd, t_embd, embd, 0, n_tokens*n_embd*sizeof(float));
                 } break;
-            case LLAMA_POOLING_TYPE_MEAN:
-            case LLAMA_POOLING_TYPE_CLS:
-            case LLAMA_POOLING_TYPE_LAST:
+            case LLAMA_POOLING_TYPE_MEAN:  // 평균 풀링
+            case LLAMA_POOLING_TYPE_CLS:   // CLS 토큰 풀링
+            case LLAMA_POOLING_TYPE_LAST:  // 마지막 토큰 풀링
                 {
-                    // extract sequence embeddings
+                    // 시퀀스별 임베딩 추출
                     auto & embd_seq_out = embd_seq;
                     embd_seq_out.clear();
 
+                    // 현재 동일 시퀀스 처리는 미구현 상태
                     GGML_ASSERT(!ubatch.equal_seqs); // TODO: handle equal splits
 
+                    // 각 토큰에 대해 시퀀스별 임베딩 추출
                     for (int32_t i = 0; i < n_tokens; i++) {
                         const llama_seq_id seq_id = ubatch.seq_id[i][0];
+                        
+                        // 이미 처리된 시퀀스는 건너뜀
                         if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
                             continue;
                         }
+                        
+                        // 새 시퀀스 임베딩 공간 할당 및 데이터 복사
                         embd_seq_out[seq_id].resize(n_embd);
                         ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_id)*sizeof(float), n_embd*sizeof(float));
                     }
                 } break;
-            case LLAMA_POOLING_TYPE_RANK:
+            case LLAMA_POOLING_TYPE_RANK:  // 랭크 기반 풀링
                 {
-                    // TODO: this likely should be the same logic as in llama_decoder_internal, but better to
-                    //       wait for an encoder model that requires this pooling type in order to test it
-                    //       https://github.com/ggerganov/llama.cpp/pull/9510
+                    // TODO: 아직 구현되지 않음, PR #9510 참조
+                    // https://github.com/ggerganov/llama.cpp/pull/9510
                     GGML_ABORT("RANK pooling not implemented yet");
                 }
-            case LLAMA_POOLING_TYPE_UNSPECIFIED:
+            case LLAMA_POOLING_TYPE_UNSPECIFIED:  // 미지정 풀링 타입
                 {
                     GGML_ABORT("unknown pooling type");
                 }
         }
     }
 
-    // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
-    // overlap with device computation.
+    // 백엔드 동기화 전에 다음 토큰을 위해 상태 초기화
+    // 이렇게 하면 초기화 CPU 작업이 디바이스 계산과 겹칠 수 있음
     ggml_backend_sched_reset(sched.get());
 
-    // TODO: hacky solution
+    // T5 아키텍처를 위한 특별 처리 (임시 해결책)
     if (model.arch == LLM_ARCH_T5 && t_embd) {
-        //cross.t_embd = t_embd;
+        //cross.t_embd = t_embd;  // 주석 처리됨
 
-        cross.n_embd = t_embd->ne[0];
-        cross.n_enc  = t_embd->ne[1];
+        // 교차 어텐션용 임베딩 차원 및 인코더 길이 저장
+        cross.n_embd = t_embd->ne[0];  // 임베딩 차원
+        cross.n_enc  = t_embd->ne[1];  // 인코더 길이
+        
+        // 교차 어텐션용 임베딩 버퍼 할당 및 데이터 복사
         cross.v_embd.resize(cross.n_embd*cross.n_enc);
         memcpy(cross.v_embd.data(), embd, ggml_nbytes(t_embd));
 
-        // remember the sequence ids used during the encoding - needed for cross attention later
+        // 인코딩 중 사용된 시퀀스 ID 기억 (나중에 교차 어텐션에 필요)
         cross.seq_ids_enc.resize(n_tokens);
         for (int32_t i = 0; i < n_tokens; i++) {
             for (int s = 0; s < ubatch.n_seq_id[i]; s++) {
@@ -1149,59 +1404,76 @@ int llama_context::encode(llama_batch & inp_batch) {
         }
     }
 
+    // 성공적으로 완료됨을 나타내는 0 반환
     return 0;
 }
 
+// 토큰 디코딩 함수 - 주어진 입력 배치를 처리하여 로짓(다음 토큰 확률)이나 임베딩 생성
+// LLM 모델의 핵심 추론 함수
 int llama_context::decode(llama_batch & inp_batch) {
+    // 빈 배치 검사 - 토큰이 없으면 오류 반환
     if (inp_batch.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
 
-    // temporary allocate memory for the input batch if needed
-    // TODO: this is incorrect for multiple sequences because pos_max() is the maximum across all sequences
+    // 임시 메모리 할당 (필요한 경우)
+    // pos가 제공되지 않았으면 현재 KV 캐시의 최대 위치 + 1부터 시작
+    // TODO: 다중 시퀀스에서는 pos_max()가 모든 시퀀스의 최대값이므로 부정확할 수 있음
     llama_batch_allocr batch_allocr(inp_batch, inp_batch.pos ? -1 : kv_self->pos_max() + 1);
 
+    // 할당된 배치 참조 저장
     const llama_batch & batch = batch_allocr.batch;
 
+    // 모델의 어휘 사전과 하이퍼파라미터 참조
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
+    // 어휘 사전 크기 (가능한 토큰 수)
     const int32_t n_vocab = vocab.n_tokens();
 
+    // 총 토큰 수와 임베딩 차원 수
     const int64_t n_tokens_all = batch.n_tokens;
     const int64_t n_embd       = hparams.n_embd;
 
-    // TODO: remove this stuff
+    // 배치 가드 클래스 - KV 캐시 슬롯 복원을 위한 RAII 패턴 구현
+    // TODO: 나중에 제거 예정
     class batch_guard {
     public:
+        // 생성자: KV 캐시 참조 저장
         batch_guard(llama_kv_cache_unified & kv_self) : kv_slot_restorer(kv_self) {
         }
 
+        // 소멸자: 작업이 완료되지 않았으면 KV 캐시 슬롯 복원
         ~batch_guard() {
             if (!is_done) {
                 kv_slot_restorer.restore();
             }
         }
 
+        // 작업 완료 표시 (소멸자에서 복원 방지)
         void done() {
             is_done = true;
         }
 
+        // KV 캐시 슬롯 정보 저장
         void save(const llama_kv_cache_slot_info & slot_info) {
             kv_slot_restorer.save(slot_info);
         }
 
     private:
-        bool is_done = false;
+        bool is_done = false;  // 작업 완료 여부
 
-        llama_kv_slot_restorer kv_slot_restorer;
+        llama_kv_slot_restorer kv_slot_restorer;  // KV 슬롯 복원기
     };
 
+    // 배치 가드 인스턴스 생성
     batch_guard bg(*kv_self);
 
+    // 배치에는 토큰 또는 임베딩 중 하나만 제공되어야 함 (둘 다 제공 불가)
     GGML_ASSERT((!batch.token && batch.embd) || (batch.token && !batch.embd)); // NOLINT
 
+    // 토큰 ID 유효성 검사 (유효 범위: 0 ~ 어휘 크기-1)
     if (batch.token) {
         for (int64_t i = 0; i < n_tokens_all; ++i) {
             if (batch.token[i] < 0 || (uint32_t) batch.token[i] >= model.vocab.n_tokens()) {
@@ -1211,278 +1483,349 @@ int llama_context::decode(llama_batch & inp_batch) {
         }
     }
 
+    // 총 토큰 수가 배치 크기 제한을 초과하지 않는지 확인
     GGML_ASSERT(n_tokens_all <= cparams.n_batch);
 
+    // 비인과적 어텐션은 마이크로 배치 크기가 토큰 수 이상이어야 함
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    // 계산 시작 시간 기록 (첫 호출 시)
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
+    // 대기 중인 토큰 수 증가
     n_queued_tokens += n_tokens_all;
 
-    // this indicates we are doing pooled embedding, so we ignore batch.logits and output all tokens
+    // 풀링된 임베딩 모드 여부 - 임베딩 모드이면서 NONE이 아닌 풀링 타입 사용 시
+    // 이 경우 배치.로짓은 무시하고 모든 토큰 출력
     const bool embd_pooled = cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
 
+    // 시퀀스별 임베딩 맵 초기화
     embd_seq.clear();
 
+    // 총 출력 수 초기화
     int64_t n_outputs_all = 0;
 
-    // count outputs
+    // 출력 수 계산
     if (batch.logits && !embd_pooled) {
+        // logits 플래그가 설정된 토큰만 출력으로 카운트
         for (uint32_t i = 0; i < n_tokens_all; ++i) {
             n_outputs_all += batch.logits[i] != 0;
         }
     } else if (logits_all || embd_pooled) {
+        // 모든 토큰 출력 (logits_all이 true이거나 풀링된 임베딩 모드)
         n_outputs_all = n_tokens_all;
     } else {
-        // keep last output only
+        // 마지막 출력만 유지 (기본 모드)
         n_outputs_all = 1;
     }
 
+    // 모든 토큰에 대해 로짓을 계산하는지 여부
     const bool logits_all = n_outputs_all == n_tokens_all;
 
+    // 배치를 sbatch(split batch) 형식으로 변환
+    // - simple_split: 비순환 모델은 단순 분할 사용
+    // - logits_all: 모든 토큰에 대해 로짓 계산 여부
     sbatch.from_batch(batch, n_embd,
             /* simple_split */ !kv_self->recurrent,
             /* logits_all   */ logits_all);
 
-    // reserve output buffer
+    // 출력 버퍼 예약 - 필요한 메모리 공간 할당
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %" PRId64 " outputs\n", __func__, n_outputs_all);
-        return -2;
+        return -2;  // 메모리 할당 실패
     };
 
+    // 이전 단계에서 처리된 출력 수 추적
     int64_t n_outputs_prev = 0;
 
+    // sbatch에 남은 토큰이 있으면 계속 처리
     while (sbatch.n_tokens > 0) {
+        // 마이크로 배치 초기화
         llama_ubatch ubatch = llama_ubatch();
 
+        // 마이크로 배치 크기 참조
         const auto & n_ubatch = cparams.n_ubatch;
 
+        // 모델 아키텍처에 따라 다른 분할 방식 사용
         if (kv_self->recurrent) {
             if (embd_pooled) {
-                // Pooled embeddings cannot be split across ubatches (yet)
+                // 풀링된 임베딩은 마이크로 배치 간에 분할할 수 없음 (아직 미구현)
                 ubatch = sbatch.split_seq(cparams.n_ubatch);
             } else {
-                // recurrent model architectures are easier to implement
-                // with equal-length sequences
+                // 순환 모델 아키텍처는 동일 길이의 시퀀스로 구현하기 쉬움
                 ubatch = sbatch.split_equal(cparams.n_ubatch);
             }
         } else {
+            // 비순환 모델은 단순 분할 사용
             ubatch = sbatch.split_simple(n_ubatch);
         }
 
-        // count the outputs in this u_batch
+        // 현재 마이크로 배치의 출력 수 계산
         {
             int32_t n_outputs_new = 0;
 
             if (n_outputs_all == n_tokens_all) {
+                // 모든 토큰이 출력 대상이면 토큰 수 = 출력 수
                 n_outputs_new = ubatch.n_tokens;
             } else {
+                // 특정 토큰만 출력 대상이면 출력 플래그 확인
                 GGML_ASSERT(ubatch.output);
                 for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
                     n_outputs_new += (int32_t) (ubatch.output[i] != 0);
                 }
             }
 
-            // needs to happen before the graph is built
+            // 출력 수 설정 (그래프 구축 전에 설정 필요)
             n_outputs = n_outputs_new;
         }
 
-        // non-causal masks do not use the KV cache
+        // 비인과적 마스크는 KV 캐시를 사용하지 않음
         if (hparams.causal_attn) {
+            // KV 캐시 업데이트 - 시프트 및 조각 모음 적용
             kv_self_update();
 
-            // if we have enough unused cells before the current head ->
-            //   better to start searching from the beginning of the cache, hoping to fill it
+            // 현재 헤드 위치 이전에 충분한 미사용 셀이 있으면
+            // 캐시 시작부터 채우기 위해 헤드 위치 재설정
             if (kv_self->head > kv_self->used + 2*ubatch.n_tokens) {
                 kv_self->head = 0;
             }
 
+            // KV 캐시에서 마이크로 배치를 위한 슬롯 찾기
             const auto slot_info = kv_self->find_slot(ubatch);
             if (!slot_info) {
                 LLAMA_LOG_ERROR("%s: failed to prepare ubatch\n", __func__);
-                return -3;
+                return -3;  // 슬롯 할당 실패
             }
 
+            // 슬롯 정보 저장 (나중에 복원 가능하도록)
             bg.save(slot_info);
 
             if (!kv_self->recurrent) {
-                // a heuristic, to avoid attending the full cache if it is not yet utilized
-                // after enough generations, the benefit from this heuristic disappears
-                // if we start defragmenting the cache, the benefit from this will be more important
+                // 휴리스틱: 캐시가 아직 완전히 활용되지 않았으면 전체 캐시에 어텐션하지 않음
+                // 충분한 생성 후에는 이 휴리스틱의 이점이 사라짐
+                // 캐시 조각 모음을 시작하면 이 기능의 중요성이 더 커짐
                 const uint32_t pad = kv_self->get_padding(cparams);
                 kv_self->n = std::min(kv_self->size, std::max(pad, GGML_PAD(kv_self->cell_max(), pad)));
             }
         }
 
+        // KV 캐시 상태 디버깅용 (주석 처리됨)
         //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self->n, kv_self->used, kv_self->head);
 
+        // 스케줄러 초기화 및 평가 콜백 설정
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+        // 계산 그래프 초기화
         auto * gf = graph_init();
+        // 디코더 타입의 계산 그래프 구축
         auto res = graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_DECODER);
 
+        // 그래프 구축 시간 디버깅용 (주석 처리됨)
         // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
 
+        // 그래프에 메모리 할당
         ggml_backend_sched_alloc_graph(sched.get(), gf);
 
+        // 입력 설정
         res->set_inputs(&ubatch);
 
+        // 그래프 계산 실행 (여러 토큰이면 병렬 처리)
         const auto compute_status = graph_compute(gf, ubatch.n_tokens > 1);
         if (compute_status != GGML_STATUS_SUCCESS) {
+            // 계산 상태에 따른 오류 반환
             switch (compute_status) {
                 case GGML_STATUS_ABORTED:
-                    return 2;
+                    return 2;  // 사용자에 의해 중단됨
                 case GGML_STATUS_ALLOC_FAILED:
-                    return -2;
+                    return -2;  // 메모리 할당 실패
                 case GGML_STATUS_FAILED:
                 default:
-                    return -3;
+                    return -3;  // 기타 실패
             }
         }
 
-        // update the kv ring buffer
+        // KV 링 버퍼 헤드 위치 업데이트
         {
+            // 처리된 토큰 수만큼 헤드 위치 증가
             kv_self->head += ubatch.n_tokens;
 
-            // Ensure kv cache head points to a valid index.
+            // KV 캐시 헤드가 유효한 인덱스를 가리키도록 보장
+            // 크기를 초과하면 처음으로 돌아감 (순환 버퍼)
             if (kv_self->head >= kv_self->size) {
                 kv_self->head = 0;
             }
         }
 
-        // plot the computation graph in dot format (for debugging purposes)
+        // 계산 그래프를 DOT 형식으로 덤프 (디버깅용, 주석 처리됨)
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
+        // 로짓 텐서와 임베딩 텐서 참조 얻기
         auto * t_logits = cparams.embeddings ? nullptr         : res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
 
+        // 풀링된 임베딩이 있으면 해당 텐서 사용
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
         }
 
-        // extract logits
+        // 로짓 추출 (토큰 확률 분포)
         if (t_logits && n_outputs > 0) {
+            // 로짓 텐서의 백엔드 얻기
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits != nullptr);
 
+            // 출력 로짓 버퍼 포인터 계산
             float * logits_out = logits + n_outputs_prev*n_vocab;
 
+            // 출력이 있으면 로짓 복사
             if (n_outputs) {
+                // 출력 인덱스 유효성 확인
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                // 메모리 크기 유효성 확인
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits_size);
+                // 로짓 데이터 비동기 복사
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
         }
 
-        // extract embeddings
+        // 임베딩 추출 (토큰 벡터 표현)
         if (t_embd && n_outputs > 0) {
+            // 임베딩 텐서의 백엔드 얻기
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
+            // 풀링 타입에 따라 다른 방식으로 임베딩 처리
             switch (cparams.pooling_type) {
                 case LLAMA_POOLING_TYPE_NONE:
                     {
-                        // extract token embeddings
+                        // 토큰별 임베딩 추출
                         GGML_ASSERT(embd != nullptr);
+                        // 출력 임베딩 버퍼 포인터 계산
                         float * embd_out = embd + n_outputs_prev*n_embd;
 
+                        // 출력이 있으면 임베딩 복사
                         if (n_outputs) {
+                            // 출력 인덱스 유효성 확인
                             GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                            // 메모리 크기 유효성 확인
                             GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd <= (int64_t) embd_size);
+                            // 임베딩 데이터 비동기 복사
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd*sizeof(float));
                         }
                     } break;
-                case LLAMA_POOLING_TYPE_MEAN:
-                case LLAMA_POOLING_TYPE_CLS:
-                case LLAMA_POOLING_TYPE_LAST:
+                case LLAMA_POOLING_TYPE_MEAN:  // 평균 풀링
+                case LLAMA_POOLING_TYPE_CLS:   // CLS 토큰 풀링
+                case LLAMA_POOLING_TYPE_LAST:  // 마지막 토큰 풀링
                     {
-                        // extract sequence embeddings (cleared before processing each batch)
+                        // 시퀀스별 임베딩 추출 (배치마다 처리 전 초기화됨)
                         auto & embd_seq_out = embd_seq;
 
+                        // 각 시퀀스에 대해 임베딩 추출
                         for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+                            // 시퀀스 ID 가져오기
                             const llama_seq_id seq_id = ubatch.seq_id[s][0];
+                            // 이미 처리된 시퀀스는 건너뜀
                             if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
                                 continue;
                             }
+                            // 새 시퀀스 임베딩 공간 할당
                             embd_seq_out[seq_id].resize(n_embd);
+                            // 임베딩 데이터 비동기 복사
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_id)*sizeof(float), n_embd*sizeof(float));
                         }
                     } break;
-                case LLAMA_POOLING_TYPE_RANK:
+                case LLAMA_POOLING_TYPE_RANK:  // 랭크 기반 풀링 (재순위화 점수)
                     {
-                        // extract the rerank score - a single float per sequence
+                        // 시퀀스당 하나의 재순위화 점수 추출 (단일 부동소수점)
                         auto & embd_seq_out = embd_seq;
 
+                        // 각 시퀀스에 대해 점수 추출
                         for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+                            // 시퀀스 ID 가져오기
                             const llama_seq_id seq_id = ubatch.seq_id[s][0];
+                            // 이미 처리된 시퀀스는 건너뜀
                             if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
                                 continue;
                             }
+                            // 재순위화 점수용 공간 할당 (1개 부동소수점)
                             embd_seq_out[seq_id].resize(1);
+                            // 점수 데이터 비동기 복사
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (seq_id)*sizeof(float), sizeof(float));
                         }
                     } break;
-                case LLAMA_POOLING_TYPE_UNSPECIFIED:
+                case LLAMA_POOLING_TYPE_UNSPECIFIED:  // 미지정 풀링 타입
                     {
                         GGML_ABORT("unknown pooling type");
                     }
             }
         }
 
+        // 이전 단계에서 처리된 출력 수 업데이트
         n_outputs_prev += n_outputs;
     }
 
-    // finalize the batch processing
+    // 배치 처리 완료 표시
     bg.done();
 
-    // set output mappings
+    // 출력 매핑 설정 (출력 인덱스 관리)
     {
+        // 출력이 정렬되어 있는지 확인
         bool sorted_output = true;
 
+        // 출력 ID 수가 총 출력 수와 일치하는지 확인
         GGML_ASSERT(sbatch.out_ids.size() == (size_t) n_outputs_all);
 
+        // 각 출력에 대해 매핑 설정
         for (int64_t i = 0; i < n_outputs_all; ++i) {
+            // 출력 ID 가져오기
             int64_t out_id = sbatch.out_ids[i];
+            // 출력 ID 매핑 설정
             output_ids[out_id] = i;
+            // 순서가 변경되었는지 확인
             if (out_id != i) {
                 sorted_output = false;
             }
         }
 
+        // 출력이 정렬되어 있으면 ID 배열 정리 (메모리 절약)
         if (sorted_output) {
             sbatch.out_ids.clear();
         }
     }
 
-    // set to total number of outputs in the batch, for use in llama_get_logits_ith
+    // 총 출력 수 설정 (llama_get_logits_ith 함수에서 사용)
     n_outputs = n_outputs_all;
 
-    // wait for the computation to finish (automatically done when obtaining the model output)
+    // 계산 완료 대기 (모델 출력 가져올 때 자동으로 수행)
     //synchronize();
 
-    // decide if we need to defrag the kv cache
+    // KV 캐시 조각 모음 필요성 결정
     if (cparams.causal_attn && cparams.defrag_thold > 0.0f) {
-        // - do not defrag small contexts (i.e. < 2048 tokens)
-        // - count the padding towards the number of used tokens
-        const float fragmentation = kv_self->n >= 2048 ? std::max(0.0f, 1.0f - float(kv_self->used + kv_self->get_padding(cparams))/float(kv_self->n)) : 0.0f;
+        // - 작은 컨텍스트는 조각 모음하지 않음 (2048 토큰 미만)
+        // - 패딩도 사용된 토큰 수에 포함
+        // 조각화 비율 계산: 미사용 셀 비율
+        const float fragmentation = kv_self->n >= 2048 ? 
+            std::max(0.0f, 1.0f - float(kv_self->used + kv_self->get_padding(cparams))/float(kv_self->n)) : 0.0f;
 
-        // queue defragmentation for next llama_kv_cache_update
+        // 조각화 비율이 임계값을 초과하면 조각 모음 요청
         if (fragmentation > cparams.defrag_thold) {
             LLAMA_LOG_DEBUG("%s: fragmentation: %.2f - requesting defrag\n", __func__, fragmentation);
 
+            // 다음 llama_kv_cache_update 호출 시 조각 모음 수행하도록 표시
             kv_self->defrag();
         }
     }
 
-    // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
-    // overlap with device computation.
+    // 다음 토큰을 위한 상태 초기화 (백엔드 동기화 전)
+    // CPU 활동이 디바이스 계산과 겹치도록 함
     ggml_backend_sched_reset(sched.get());
 
+    // 성공적으로 완료됨을 나타내는 0 반환
     return 0;
 }
 
@@ -2792,3 +3135,11 @@ void llama_perf_context_print(const llama_context * ctx) {
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
 }
+
+//내가추가---------------------------------------------------------------------
+const llama_kv_cache_unified *
+llama_get_kv_cache_unified(const llama_context * ctx) {
+    if (!ctx) return nullptr;
+    return dynamic_cast<const llama_kv_cache_unified *>(ctx->kv_self.get());
+}
+//-------------------------------------------------------------------------

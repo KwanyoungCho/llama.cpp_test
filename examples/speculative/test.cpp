@@ -4,8 +4,6 @@
 #include "log.h"
 #include "llama.h"
 
-#include "kv_frag.hpp"
-
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -13,6 +11,66 @@
 #include <set>
 #include <string>
 #include <vector>
+
+// KV 캐시 프래그먼트 측정을 위한 카운터들
+struct kv_cache_stats {
+    int rm_ops_tgt = 0;     // target 모델 KV 삭제 연산 수
+    int keep_ops_tgt = 0;   // target 모델 KV 유지 연산 수
+    int cp_ops_tgt = 0;     // target 모델 KV 복사 연산 수
+    int rm_ops_dft = 0;     // draft 모델 KV 삭제 연산 수
+    int keep_ops_dft = 0;   // draft 모델 KV 유지 연산 수
+    int cp_ops_dft = 0;     // draft 모델 KV 복사 연산 수
+    
+    // 타겟 모델과 드래프트 모델의 최대 시퀀스 수
+    int max_active_seqs_tgt = 0;
+    int max_active_seqs_dft = 0;
+    
+    // 프래그먼트 측정을 위한 변수들
+    int rejected_tokens = 0;         // 거부된 토큰 수
+    int total_tokens = 0;            // 총 토큰 수
+
+    // KV 캐시의 빈 셀 추적 (실제 프래그먼트 측정용)
+    std::vector<bool> cell_occupied;    // 각 셀의 점유 상태
+    int cell_count = 0;                 // 총 셀 수
+    int empty_cells_count = 0;          // 빈 셀 수
+    int fragments_count = 0;            // 프래그먼트 수 (중간의 빈 셀)
+};
+
+// 전역 통계 객체
+kv_cache_stats g_kv_stats;
+
+// KV 캐시 연산을 래핑하는 함수들 (프로토타입 선언)
+void track_kv_rm(llama_context *ctx, int seq_id, int p0, int p1, bool is_draft);
+void track_kv_keep(llama_context *ctx, int seq_id, bool is_draft);
+void track_kv_cp(llama_context *ctx, int seq_id_src, int seq_id_dst, int p0, int p1, bool is_draft);
+
+// KV 캐시 연산을 래핑하는 함수들 (구현)
+void track_kv_rm(llama_context *ctx, int seq_id, int p0, int p1, bool is_draft) {
+    if (is_draft) {
+        g_kv_stats.rm_ops_dft++;
+    } else {
+        g_kv_stats.rm_ops_tgt++;
+    }
+    llama_kv_self_seq_rm(ctx, seq_id, p0, p1);
+}
+
+void track_kv_keep(llama_context *ctx, int seq_id, bool is_draft) {
+    if (is_draft) {
+        g_kv_stats.keep_ops_dft++;
+    } else {
+        g_kv_stats.keep_ops_tgt++;
+    }
+    llama_kv_self_seq_keep(ctx, seq_id);
+}
+
+void track_kv_cp(llama_context *ctx, int seq_id_src, int seq_id_dst, int p0, int p1, bool is_draft) {
+    if (is_draft) {
+        g_kv_stats.cp_ops_dft++;
+    } else {
+        g_kv_stats.cp_ops_tgt++;
+    }
+    llama_kv_self_seq_cp(ctx, seq_id_src, seq_id_dst, p0, p1);
+}
 
 // 스펙큘레이티브 디코딩에서 허용되는 타겟 모델과 드래프트 모델 간의 최대 어휘 크기 차이
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -41,6 +99,9 @@ int main(int argc, char ** argv) {
     common_log_set_prefix    (common_log_main(), true); // 레벨/시간 접두사
     common_log_set_timestamps(common_log_main(), true); // [M.S.ms.µs] 타임스탬프
 
+    // KV 캐시 셀 추적 초기화 (기본 크기를 4096으로 설정)
+    g_kv_stats.cell_occupied.resize(4096, false);
+    g_kv_stats.cell_count = 4096;
     
     common_params params;
 
@@ -240,7 +301,6 @@ int main(int argc, char ** argv) {
     drafts[0].i_batch_tgt.resize(1);
     drafts[0].i_batch_tgt[0] = 0;
 
-    
     // 메인 생성 루프
     while (true) {
         // 활성 시퀀스 추적을 위한 집합
@@ -258,6 +318,9 @@ int main(int argc, char ** argv) {
             LOG_DBG("draft %d: %s\n", s, string_from(ctx_dft, tokens).c_str());
         }
 
+        // 활성 시퀀스 수 최댓값 업데이트
+        g_kv_stats.max_active_seqs_dft = std::max(g_kv_stats.max_active_seqs_dft, (int)active_seqs.size());
+
         int i_dft  = 0;  // 드래프트 토큰 인덱스
         int s_keep = 0;  // 유지할 시퀀스 인덱스
 
@@ -266,7 +329,7 @@ int main(int argc, char ** argv) {
 
         // 드래프트 토큰이 더 이상 없거나 토큰 검증에 실패할 때까지 반복
         while (true) {
-            
+
             // 타겟 모델의 토큰이 드래프트 시퀀스와 일치하는지 확인
             // 확률적 샘플링의 경우, 드래프트 토큰과 타겟 토큰의 매칭 시도
             {
@@ -281,7 +344,7 @@ int main(int argc, char ** argv) {
 
                     float p_tgt = 0.0f;  // 타겟 모델에서의 토큰 확률
                     float p_dft = 0.0f;  // 드래프트 모델에서의 토큰 확률
-                    
+
                     // 활성 시퀀스가 있는 동안 반복
                     while (active_seqs.size() > 0) {
                         // 활성 시퀀스에서 무작위로 검증할 시퀀스 선택
@@ -303,8 +366,8 @@ int main(int argc, char ** argv) {
                             }
                             continue;
                         }
-                        
-                        //LOG_DBG("verifying sequence #%d at pos #%d from %d active sequence(s)\n", s, i_dft, (int) active_seqs.size());
+
+                        LOG_DBG("verifying sequence #%d at pos #%d from %d active sequence(s)\n", s, i_dft, (int) active_seqs.size());
                         
                         // 0~1 사이의 무작위 값 생성 (확률적 수락을 위함)
                         float r = u_dist(rng);
@@ -325,8 +388,7 @@ int main(int argc, char ** argv) {
                                 break;
                             }
                         }
-                        
-                        //LOG_DBG("r = %f, p_dft = %f, p_tgt = %f\n", r, p_dft, p_tgt);
+                        LOG_DBG("r = %f, p_dft = %f, p_tgt = %f\n", r, p_dft, p_tgt);
                         
                         // 스펙큘레이티브 검증: r ≤ p_tgt/p_dft 일 때 수락
                         // 이는 드래프트 모델에서 확률이 높지만 타겟 모델에서는 낮은 토큰을 필터링함
@@ -341,8 +403,41 @@ int main(int argc, char ** argv) {
                             break;
                         } else {
                             // 토큰 거부 - 현재 시퀀스 비활성화
-                            //LOG_DBG("draft token %d of sequence %d (%d, '%s') rejected\n", i_dft, s, drafts[s].tokens[i_dft], common_token_to_piece(ctx_tgt, drafts[s].tokens[i_dft]).c_str());
+                            LOG_DBG("draft token %d of sequence %d (%d, '%s') rejected\n", i_dft, s, drafts[s].tokens[i_dft], common_token_to_piece(ctx_tgt, drafts[s].tokens[i_dft]).c_str());
                             drafts[s].active = false;
+
+                            // 토큰 거부 카운터 증가
+                            g_kv_stats.rejected_tokens++;
+                            g_kv_stats.total_tokens++;
+                            
+                            // KV 캐시 프래그먼트 추적
+                            // 현재 위치에 셀을 점유했다가 거부로 인해 빈 공간 발생
+                            int cell_pos = n_past_dft + i_dft;
+                            if (cell_pos < (int)g_kv_stats.cell_occupied.size()) {
+                                if (i_dft > 0) {  // 첫 번째 토큰은 항상 접근 가능하므로 제외
+                                    // 이전 셀이 사용 중이고 다음 셀도 사용될 예정이면 프래그먼트
+                                    bool has_prev = (cell_pos > 0) && g_kv_stats.cell_occupied[cell_pos-1];
+                                    bool has_next = false;
+                                    
+                                    // 다른 활성 시퀀스들 중 다음 위치에 토큰이 있는지 확인
+                                    for (int other_s = 0; other_s < n_seq_dft; ++other_s) {
+                                        if (other_s != s && drafts[other_s].active && 
+                                            i_dft + 1 < (int)drafts[other_s].tokens.size()) {
+                                            has_next = true;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    // 프래그먼트 발생: 중간에 빈 셀이 생김
+                                    if (has_prev && has_next) {
+                                        g_kv_stats.fragments_count++;
+                                        LOG_DBG("KV cache fragment detected at position %d\n", cell_pos);
+                                    }
+                                    
+                                    // 빈 셀 카운트 증가
+                                    g_kv_stats.empty_cells_count++;
+                                }
+                            }
 
                             // 잔여 확률 계산 (드래프트 모델의 예측을 제외한 확률 분포)
                             GGML_ASSERT(dist_tgt.sorted);
@@ -398,11 +493,11 @@ int main(int argc, char ** argv) {
                             }
                         }
                     }
-                    
+
                     // 모든 드래프트 토큰이 거부된 경우
                     if (!accept) {
                         // 잔여 확률 분포에서 새 토큰 샘플링
-                        //LOG_DBG("all drafted tokens were rejected, sampling from residual distribution\n");
+                        LOG_DBG("all drafted tokens were rejected, sampling from residual distribution\n");
                         std::vector<float> probs(dist_tgt.size);
                         for (size_t i = 0; i < dist_tgt.size; ++i) {
                             probs[i] = dist_tgt.data[i].p;
@@ -444,7 +539,7 @@ int main(int argc, char ** argv) {
                         }
                     }
                 }
-                
+
                 // 토큰이 생성 종료 토큰인지 확인
                 if (llama_vocab_is_eog(vocab_tgt, token_id)) {
                     has_eos = true;
@@ -458,67 +553,48 @@ int main(int argc, char ** argv) {
                     ++n_past_dft;  // 드래프트 모델 컨텍스트 위치 증가
                     ++i_dft;  // 다음 드래프트 토큰으로 이동
                     
+                    // 토큰 수락 카운터 증가
+                    g_kv_stats.total_tokens++;
+                    
+                    // 수락된 토큰 위치에 셀 점유 표시
+                    int cell_pos = n_past_dft + i_dft - 1;
+                    if (cell_pos < (int)g_kv_stats.cell_occupied.size()) {
+                        g_kv_stats.cell_occupied[cell_pos] = true;
+                    }
+                    
                     // 토큰 출력 (색상 지정 여부에 따라)
                     if (params.use_color) {
                         // 시퀀스 번호에 따라 토큰 색상 지정
-                        //LOG("\u001b[%dm%s\u001b[37m", (36 - s_keep % 6), token_str.c_str());
+                        LOG("\u001b[%dm%s\u001b[37m", (36 - s_keep % 6), token_str.c_str());
                     } else {
-                        //LOG("%s", token_str.c_str());
+                        LOG("%s", token_str.c_str());
                     }
                     continue;  // 다음 드래프트 토큰 검증 계속
                 } else {
                     // 드래프트 토큰이 거부된 경우
-                    //LOG("%s", token_str.c_str());
+                    LOG("%s", token_str.c_str());
                     break;  // 드래프트 검증 루프 종료
                 }
             }
         }
 
         {
-            //LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", token_id, token_str.c_str());
+            LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", token_id, token_str.c_str());
 
             // TODO: simplify
-            {   
-                LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
-                LOG_DBG("KV cache 정리 단계 \n");
-                LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
-                
+            {
                 LOG_DBG("keeping sequence %d, n_past_tgt = %d, n_past_dft = %d\n", s_keep, n_past_tgt, n_past_dft);
-                
-                //내가추가--------------------------------------
-                LOG_DBG("\n--- 정리하기 전 draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str());
 
                 // KV 캐시를 정리하고 유지할 시퀀스만 보존
-                llama_kv_self_seq_keep(ctx_dft, s_keep);
-                LOG_DBG("\n--- 선택한 seq만 남김 : draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str());
-                llama_kv_self_seq_cp  (ctx_dft, s_keep, 0, -1, -1);
-                llama_kv_self_seq_keep(ctx_dft, 0);
-                LOG_DBG("\n--- seq를 0으로 변경 : draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str());
-                
-                
-                llama_kv_self_seq_rm  (ctx_tgt, s_keep, n_past_tgt, -1);
-                llama_kv_self_seq_keep(ctx_tgt, s_keep);
-                llama_kv_self_seq_cp  (ctx_tgt, s_keep, 0, -1, -1);
-                llama_kv_self_seq_keep(ctx_tgt, 0);
-                
+                track_kv_keep(ctx_dft, s_keep, true);
+                track_kv_cp(ctx_dft, s_keep, 0, -1, -1, true);
+                track_kv_keep(ctx_dft, 0, true);
+
+                track_kv_rm(ctx_tgt, s_keep, n_past_tgt, -1, false);
+                track_kv_keep(ctx_tgt, s_keep, false);
+                track_kv_cp(ctx_tgt, s_keep, 0, -1, -1, false);
+                track_kv_keep(ctx_tgt, 0, false);
             }
-
-            //내가추가--------------------------------------
-            {
-                auto st_d = kv_cache_fragmentation(ctx_dft);
-                auto st_t = kv_cache_fragmentation(ctx_tgt);
-                
-                //LOG_DBG("\n--- 정리한 후 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str());
-                //LOG_DBG("\n--- target cache ---\n%s", kv_cache_dump(ctx_tgt, 10).c_str());
-
-
-                LOG_DBG("KV-FRAG draft : live %u, hole %u, %.2f%%\n",
-                        st_d.live_cells,  st_d.inner_holes, frag_ratio(st_d));
-                LOG_DBG("KV-FRAG target: live %u, hole %u, %.2f%%\n",
-                        st_t.live_cells,  st_t.inner_holes, frag_ratio(st_t));
-            }
-            //----------------------------------------------------
-
 
             // 모든 드래프트 시퀀스 초기화
             for (int s = 0; s < n_seq_dft; ++s) {
@@ -527,7 +603,7 @@ int main(int argc, char ** argv) {
                 drafts[s].i_batch_tgt.clear();
                 drafts[s].dists.clear();
             }
-            // 타겟 모델에서 생성된 토큰을 첫 번째 드래프트 시퀀스에 추가
+            // 타겟 모델에서 생성된 토큰을 첫 번째 드래프트 시퀀스에 추가 (나중에 지워짐)
             drafts[0].tokens.push_back(token_id);
             drafts[0].dists.push_back(std::vector<llama_token_data>());
             drafts[0].i_batch_tgt.push_back(0);
@@ -536,21 +612,13 @@ int main(int argc, char ** argv) {
             common_batch_clear(batch_dft);
             common_batch_add  (batch_dft, token_id, n_past_dft, { 0 }, true);
 
-
-            //내가추가--------------------------------------
-            LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
-            LOG_DBG("draft KV cache에 bonus token 추가 \n");
-            LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
-            LOG_DBG("정리하기 전 draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str());
             // 드래프트 모델의 KV 캐시에서 불필요한 부분 제거
-            llama_kv_self_seq_rm(ctx_dft, 0, n_past_dft, -1);
-            LOG_DBG("통과한 것만 남김 draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str());
+            track_kv_rm(ctx_dft, 0, n_past_dft, -1, true);
             // 드래프트 모델로 새 토큰 디코딩
             llama_decode(ctx_dft, batch_dft);
-            LOG_DBG("target token 추가 draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str());
+
             // 드래프트 모델의 컨텍스트 위치 증가
             ++n_past_dft;
-            
         }
 
         // 생성 종료 조건 확인: 예측 토큰 수 또는 EOS 토큰
@@ -583,12 +651,6 @@ int main(int argc, char ** argv) {
         common_batch_clear(batch_tgt);
         common_batch_add  (batch_tgt, drafts[0].tokens[0], n_past_tgt, { 0 }, true);
 
-        //내가추가--------------------------------------
-        LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
-        LOG_DBG("drafting 단계 \n");
-        LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
-        
-
         // 트리 기반 샘플링을 사용하여 드래프트 모델에서 n_draft 개의 토큰 샘플링
         for (int i = 0; i < n_draft; ++i) {
             batch_dft.n_tokens = 0;
@@ -613,8 +675,8 @@ int main(int argc, char ** argv) {
 
                 // 디버깅 목적으로 상위 후보 토큰들 출력
                 for (int k = 0; k < std::min(n_seq_dft + 3, (int) cur_p->size); ++k) {
-                    //LOG_DBG(" - draft candidate %3d for seq %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                    //        k, s, i, cur_p->data[k].id, cur_p->data[k].p, common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    LOG_DBG(" - draft candidate %3d for seq %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                            k, s, i, cur_p->data[k].id, cur_p->data[k].p, common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
                 // 현재 시퀀스 ID를 저장하는 벡터 (브랜치 분할에 사용)
@@ -625,11 +687,11 @@ int main(int argc, char ** argv) {
                 for (int f = 1; f < 8; ++f) {
                     // 현재 활성 시퀀스 수가 최대치보다 작고, 후보 토큰의 확률이 임계값보다 높은 경우
                     if (n_seq_cur < n_seq_dft && cur_p->data[f].p > p_draft_split) {
-                        //LOG_DBG("splitting seq %3d into %3d\n", s, n_seq_cur);
+                        LOG_DBG("splitting seq %3d into %3d\n", s, n_seq_cur);
 
                         // 새 시퀀스를 위한 KV 캐시 cell의 seq id 변경 (브랜치 생성)
-                        llama_kv_self_seq_rm(ctx_dft,    n_seq_cur, -1, -1);
-                        llama_kv_self_seq_cp(ctx_dft, s, n_seq_cur, -1, -1);
+                        track_kv_rm(ctx_dft,    n_seq_cur, -1, -1, true);
+                        track_kv_cp(ctx_dft, s, n_seq_cur, -1, -1, true);
 
                         // 이 브랜치의 이전 토큰들을 새 브랜치에도 추가
                         for (int t = 0; t < batch_tgt.n_tokens; ++t) {
@@ -712,37 +774,39 @@ int main(int argc, char ** argv) {
             if (batch_tgt.n_tokens > n_draft) {
                 break;
             }
-            
-            LOG_DBG("draft step : %d, draft bitmap ---\n%s\n", i, kv_cache_table(ctx_dft).c_str());
         }
 
         // 타겟 모델에서 드래프트된 토큰 평가
         {
-            
             // KV 캐시 준비: 첫 번째 시퀀스만 유지하고 나머지 시퀀스에 복사
-            llama_kv_self_seq_keep(ctx_tgt, 0);
+            track_kv_keep(ctx_tgt, 0, false);
             for (int s = 1; s < n_seq_dft; ++s) {
-                llama_kv_self_seq_cp(ctx_tgt, 0, s, -1, -1);
+                track_kv_cp(ctx_tgt, 0, s, -1, -1, false);
             }
-            
+
+            // 타겟 모델의 활성 시퀀스 수 최댓값 업데이트
+            int active_tgt_seqs = 0;
+            for (int s = 0; s < n_seq_dft; ++s) {
+                if (drafts[s].active) {
+                    active_tgt_seqs++;
+                }
+            }
+            g_kv_stats.max_active_seqs_tgt = std::max(g_kv_stats.max_active_seqs_tgt, active_tgt_seqs);
+
             // 타겟 모델에서 배치 디코딩
             // LOG_DBG("target batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_tgt, batch_tgt).c_str());
             llama_decode(ctx_tgt, batch_tgt);
             ++n_past_tgt;  // 타겟 모델 컨텍스트 위치 증가
-            
         }
 
-        
         // 첫 번째 토큰은 스펙큘레이션 루프 전에 타겟 모델에서 이미 제안되었으므로 여기서 제거
         for (int s = 0; s < n_seq_dft; ++s) {
             if (!drafts[s].active) {
-                
                 continue;
             }
-            
+
             drafts[s].tokens.erase(drafts[s].tokens.begin());
             drafts[s].dists.erase(drafts[s].dists.begin());
-            
         }
     }
 
@@ -760,6 +824,37 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+
+    // KV 캐시 통계 출력
+    LOG_INF("\n");
+    LOG_INF("KV Cache Statistics:\n");
+    LOG_INF("Target model rm operations:   %d\n", g_kv_stats.rm_ops_tgt);
+    LOG_INF("Target model keep operations: %d\n", g_kv_stats.keep_ops_tgt);
+    LOG_INF("Target model cp operations:   %d\n", g_kv_stats.cp_ops_tgt);
+    LOG_INF("Draft model rm operations:    %d\n", g_kv_stats.rm_ops_dft);
+    LOG_INF("Draft model keep operations:  %d\n", g_kv_stats.keep_ops_dft);
+    LOG_INF("Draft model cp operations:    %d\n", g_kv_stats.cp_ops_dft);
+    LOG_INF("Max active sequences (target): %d\n", g_kv_stats.max_active_seqs_tgt);
+    LOG_INF("Max active sequences (draft):  %d\n", g_kv_stats.max_active_seqs_dft);
+    LOG_INF("Rejected tokens:               %d\n", g_kv_stats.rejected_tokens);
+    LOG_INF("Total tokens processed:        %d\n", g_kv_stats.total_tokens);
+    LOG_INF("Fragment rate (naive):         %.3f%%\n", 100.0f * g_kv_stats.rejected_tokens / g_kv_stats.total_tokens);
+    LOG_INF("KV Cache fragments:            %d\n", g_kv_stats.fragments_count);
+    LOG_INF("Fragment rate (actual):        %.3f%%\n", 100.0f * g_kv_stats.fragments_count / g_kv_stats.total_tokens);
+    LOG_INF("Empty KV cells:                %d\n", g_kv_stats.empty_cells_count);
+    
+    // 사용된 셀 및 빈 셀 비율 계산
+    int used_cells = 0;
+    for (size_t i = 0; i < g_kv_stats.cell_occupied.size(); ++i) {
+        if (g_kv_stats.cell_occupied[i]) {
+            used_cells++;
+        }
+    }
+    
+    if (n_past_dft > 0) {
+        LOG_INF("Used KV cells:                %d / %d (%.3f%%)\n", 
+                used_cells, n_past_dft, 100.0f * used_cells / n_past_dft);
+    }
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");
