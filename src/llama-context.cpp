@@ -889,8 +889,14 @@ void llama_context::kv_self_update() {
     if (kv->do_defrag) {
         LLAMA_LOG_DEBUG("%s: defragmenting KV cache\n", __func__);  // 디버그 로그
 
+        // 전체 defrag 과정 시간 측정 시작
+        const int64_t t_defrag_start = ggml_time_us();
+
         // 조각 모음 준비 (그래프 노드 수 제한 확인)
         if (kv->defrag_prepare(graph_max_nodes())) {
+            // 그래프 빌드 및 계산 시간 측정 시작
+            const int64_t t_graph_start = ggml_time_us();
+
             ggml_backend_sched_reset(sched.get());  // 스케줄러 초기화
 
             auto * gf = graph_init();  // 새 계산 그래프 초기화
@@ -907,10 +913,18 @@ void llama_context::kv_self_update() {
             // 그래프 계산 실행 (동기화 없이)
             graph_compute(gf, false);
 
+            // 그래프 빌드 및 계산 시간 측정 종료
+            const int64_t t_graph_end = ggml_time_us();
+            LLAMA_LOG_INFO("%s: defrag graph build and compute took %.3f ms\n", __func__, (t_graph_end - t_graph_start) / 1000.0f);
+
             need_reserve = true;  // 리소스 예약 필요 표시
         }
 
         kv->do_defrag = false;  // 조각 모음 완료 표시
+
+        // 전체 defrag 과정 시간 측정 종료
+        const int64_t t_defrag_end = ggml_time_us();
+        LLAMA_LOG_INFO("%s: total defragmentation took %.3f ms\n", __func__, (t_defrag_end - t_defrag_start) / 1000.0f);
     }
 
     // 필요한 경우 최악의 경우 그래프 예약
@@ -1593,6 +1607,7 @@ int llama_context::decode(llama_batch & inp_batch) {
 
             // KV 캐시에서 마이크로 배치를 위한 슬롯 찾기
             const auto slot_info = kv_self->find_slot(ubatch);
+            
             if (!slot_info) {
                 LLAMA_LOG_ERROR("%s: failed to prepare ubatch\n", __func__);
                 return -3;  // 슬롯 할당 실패
@@ -1645,6 +1660,10 @@ int llama_context::decode(llama_batch & inp_batch) {
                     return -3;  // 기타 실패
             }
         }
+        //내가 추가 ----------------------------------------
+        // LLAMA_LOG_INFO("\nubatch n_tokens %d\n", ubatch.n_tokens);
+        // LLAMA_LOG_INFO("ubatch n_seq_tokens %d\n", ubatch.n_seq_tokens);
+        // LLAMA_LOG_INFO("ubatch n_seqs %d\n\n", ubatch.n_seqs);
 
         // KV 링 버퍼 헤드 위치 업데이트
         {
@@ -1806,15 +1825,24 @@ int llama_context::decode(llama_batch & inp_batch) {
 
     // KV 캐시 조각 모음 필요성 결정
     if (cparams.causal_attn && cparams.defrag_thold > 0.0f) {
+        // LLAMA_LOG_INFO("defrag_thold : %f\n", cparams.defrag_thold);
         // - 작은 컨텍스트는 조각 모음하지 않음 (2048 토큰 미만)
         // - 패딩도 사용된 토큰 수에 포함
+        
+        // 조각화 감지 시작 시간 측정
+        const auto t_frag_check_start = ggml_time_us();
+        
         // 조각화 비율 계산: 미사용 셀 비율
-        const float fragmentation = kv_self->n >= 2048 ? 
+        const float fragmentation = kv_self->n < 2048 ? 
             std::max(0.0f, 1.0f - float(kv_self->used + kv_self->get_padding(cparams))/float(kv_self->n)) : 0.0f;
 
         // 조각화 비율이 임계값을 초과하면 조각 모음 요청
         if (fragmentation > cparams.defrag_thold) {
-            LLAMA_LOG_DEBUG("%s: fragmentation: %.2f - requesting defrag\n", __func__, fragmentation);
+            // 조각화 감지 종료 시간 측정
+            const auto t_frag_check_end = ggml_time_us();
+            LLAMA_LOG_INFO("%s: fragmentation check took %.3f ms\n", __func__, (t_frag_check_end - t_frag_check_start) / 1000.0f);
+            
+            LLAMA_LOG_INFO("%s: fragmentation: %.2f - requesting defrag\n", __func__, fragmentation);
 
             // 다음 llama_kv_cache_update 호출 시 조각 모음 수행하도록 표시
             kv_self->defrag();

@@ -943,6 +943,9 @@ size_t llama_kv_cache_unified::size_v_bytes() const {
  * @return           조각 모음 준비 성공 여부
  */
 bool llama_kv_cache_unified::defrag_prepare(int32_t n_max_nodes) {
+    // 시간 측정 시작
+    const int64_t t_start = ggml_time_us();
+
     // 모델의 레이어 수 가져오기
     const uint32_t n_layer = hparams.n_layer;
 
@@ -1104,12 +1107,18 @@ bool llama_kv_cache_unified::defrag_prepare(int32_t n_max_nodes) {
         return false;
     }
 
+    // 시간 측정 종료
+    const int64_t t_end = ggml_time_us();
+    
     // 디버그 로그: 이동 계획된 셀 수 출력
     LLAMA_LOG_DEBUG("(tmp log) KV defrag cell moves: %u\n", n_moves);
 
     // 예상되는 GGML 계산 그래프 노드 수 출력
     // 이는 계산 자원 사용량 예측에 사용됨
     LLAMA_LOG_DEBUG("expected gf nodes: %u\n", 6*n_moves*n_layer);
+    
+    // defrag_prepare 함수의 실행 시간 출력
+    LLAMA_LOG_INFO("%s: defrag_prepare took %.3f ms\n", __func__, (t_end - t_start) / 1000.0f);
 
     // 조각 모음 계획 수립 완료
     // 실제 셀 데이터 이동은 defrag() 함수에서 수행됨

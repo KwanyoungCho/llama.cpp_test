@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstring>
 #include <algorithm>
 #include <sstream>   // std::ostringstream
 #include <iomanip>   // std::setw
@@ -186,4 +187,83 @@ inline std::string kv_cache_table(const llama_context * ctx,
             oss << '\n';
     }
     return oss.str();
+}
+
+
+// CSV 헤더는 한 번만 찍도록 static 플래그 사용
+inline void save_frag(const char * kind,          // "draft" | "target"
+                      int          seq_len,       // 현재 컨텍스트 길이
+                      const llama_context * ctx)  // 측정할 컨텍스트
+{
+    // 1) 목적 파일 경로 선택
+    const char * path = std::strcmp(kind, "draft") == 0
+                        ? "kv_frag_draft.csv"
+                        : "kv_frag_target.csv";
+
+    // 2) 헤더는 파일마다 첫 번만 출력
+    static bool first_draft  = true;
+    static bool first_target = true;
+    bool & first = (std::strcmp(kind, "draft") == 0) ? first_draft : first_target;
+
+    FILE * fp = std::fopen(path, "a");
+    if (!fp) { std::perror(path); return; }
+
+    if (first) {
+        std::fprintf(fp, "seq_len,total,ratio\n");
+        first = false;
+    }
+
+    // 3) 조각률 계산
+    kv_frag_stat st = kv_cache_fragmentation(ctx);
+    uint32_t total  = st.live_cells + st.inner_holes;
+
+    std::fprintf(fp, "%d,%u,%.3f\n", seq_len, total, frag_ratio(st));
+    std::fclose(fp);
+}
+
+// ---------------------------------------------------------------
+// decoding time을 csv 파일에 저장하는 함수
+// ---------------------------------------------------------------
+inline void save_decode_time(int n_past_tgt,           // 타겟 모델 컨텍스트 위치 (token position)
+                            float decode_time_ms,     // 디코딩에 소요된 시간 (밀리초)
+                            const llama_context * ctx_tgt) // 타겟 컨텍스트 (do_defrag 상태 확인용)
+{
+    const char* path = "decode_time.csv";
+    
+    // 헤더는 파일이 존재하지 않을 때만 출력
+    static bool first_write = true;
+    
+    // 파일이 존재하는지 확인
+    bool file_exists = false;
+    {
+        FILE* fp = std::fopen(path, "r");
+        if (fp) {
+            file_exists = true;
+            std::fclose(fp);
+        }
+    }
+    
+    // do_defrag 플래그 확인
+    int do_defrag = 0;
+    const llama_kv_cache_unified * kc = llama_get_kv_cache_unified(ctx_tgt);
+    if (kc && kc->do_defrag) {
+        do_defrag = 1;
+    }
+    
+    // 파일 열기 (추가 모드)
+    FILE* fp = std::fopen(path, "a");
+    if (!fp) { 
+        std::perror(path); 
+        return; 
+    }
+    
+    // 헤더 출력 (파일이 존재하지 않는 경우)
+    if (!file_exists && first_write) {
+        std::fprintf(fp, "n_past_tgt,decode_time_ms,do_defrag\n");
+        first_write = false;
+    }
+    
+    // 데이터 출력 (do_defrag 상태 포함)
+    std::fprintf(fp, "%d,%.3f,%d\n", n_past_tgt, decode_time_ms, do_defrag);
+    std::fclose(fp);
 }
