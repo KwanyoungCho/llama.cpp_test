@@ -83,6 +83,16 @@ struct llama_kv_cache_slot_info {
     operator bool() const { return found; }
 };
 
+// 내가추가 ----------------------------------------------------------------
+struct llama_kv_cache_slot_info_multi {
+    std::vector<uint32_t> offs;   // 각 세그먼트 시작
+    std::vector<uint32_t> lens;   // 각 세그먼트 길이
+    uint32_t total = 0;           // 전체 토큰수
+    operator bool() const { return total > 0; }
+};
+// ----------------------------------------------------------------
+
+
 /**
  * @brief 통합된 KV 캐시 구현 클래스 (링 버퍼 형태)
  * 
@@ -169,7 +179,11 @@ public:
      * @param batch 처리할 마이크로 배치
      * @return 찾은 슬롯 정보
      */
-    llama_kv_cache_slot_info find_slot(const llama_ubatch & batch);
+
+    // 내가추가 ----------------------------------------------------------------
+    llama_kv_cache_slot_info find_slot(const llama_ubatch & batch); // 원래 함수 이름 변경 find_slot -> find_slot_contig
+    llama_kv_cache_slot_info_multi find_slot_split(const llama_ubatch & batch); // Target model에 적용
+    // ----------------------------------------------------------------
 
     // 컨텍스트 파라미터에 따른 패딩 값 계산
     uint32_t get_padding(const llama_cparams & cparams) const;
@@ -237,6 +251,10 @@ public:
     // 레이어별 K, V 텐서 배열
     std::vector<ggml_tensor *> k_l;  // 각 레이어의 K(key) 텐서
     std::vector<ggml_tensor *> v_l;  // 각 레이어의 V(value) 텐서
+
+    // 내가추가 ----------------------------------------------------------------
+    bool  allow_split = false;
+    // ----------------------------------------------------------------
 
 private:
     // K, V 텐서의 데이터 타입 (기본값: F16)

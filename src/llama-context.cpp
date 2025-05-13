@@ -842,6 +842,23 @@ llm_graph_result_ptr llama_context::build_kv_self_defrag(
 void llama_context::kv_self_update() {
     auto & kv = kv_self;  // KV 캐시 참조
 
+    // 내가추가 ----------------------------------------------------------------
+    //----------------------------------------------------------------
+    // ✨ 1.  split-mode  fast-path  (타깃 캐시만)
+    //----------------------------------------------------------------
+    // if (kv->allow_split) {
+    //     // 연속성 가정 없이도 build_attn 이 정확히 동작하려면
+    //     // n = 마지막 사용 셀 + padding   으로만 맞춰 주면 충분
+    //     if (!kv->recurrent) {
+    //         const uint32_t pad = kv->get_padding(cparams);
+    //         kv->n = std::min(kv->size,
+    //                          std::max(pad, GGML_PAD(kv->cell_max(), pad)));
+    //     }
+    //     // shift / defrag / worst-case reserve 모두 SKIP
+    //     return;
+    // }
+    // ----------------------------------------------------------------
+
     bool need_reserve = false;  // 최악의 경우 그래프 예약 필요 여부
 
     // 시프트가 필요한 경우
@@ -1422,6 +1439,15 @@ int llama_context::encode(llama_batch & inp_batch) {
     return 0;
 }
 
+// 내가추가 ----------------------------------------------------------------
+void llama_context::kv_cache_allow_split(bool enable) {
+    auto * kv = kv_self.get();
+    if (kv) {
+        kv->allow_split = enable;
+    }
+}
+// ----------------------------------------------------------------
+
 // 토큰 디코딩 함수 - 주어진 입력 배치를 처리하여 로짓(다음 토큰 확률)이나 임베딩 생성
 // LLM 모델의 핵심 추론 함수
 int llama_context::decode(llama_batch & inp_batch) {
@@ -1474,7 +1500,15 @@ int llama_context::decode(llama_batch & inp_batch) {
         void save(const llama_kv_cache_slot_info & slot_info) {
             kv_slot_restorer.save(slot_info);
         }
-
+        // 내가추가 ----------------------------------------------------------------
+        void save(const llama_kv_cache_slot_info_multi & slot_multi) {
+            for (size_t s = 0; s < slot_multi.offs.size(); ++s) {
+                uint32_t b = slot_multi.offs[s];
+                uint32_t e = b + slot_multi.lens[s];
+                kv_slot_restorer.save({b, e});
+            }
+        }
+        // ----------------------------------------------------------------
     private:
         bool is_done = false;  // 작업 완료 여부
 
@@ -1602,19 +1636,53 @@ int llama_context::decode(llama_batch & inp_batch) {
             // 현재 헤드 위치 이전에 충분한 미사용 셀이 있으면
             // 캐시 시작부터 채우기 위해 헤드 위치 재설정
             if (kv_self->head > kv_self->used + 2*ubatch.n_tokens) {
+                LLAMA_LOG_INFO("head 위치를 0으로 변경");
+                LLAMA_LOG_INFO("kv_self->head: %u, kv_self->used: %u, ubatch.n_tokens: %u\n", kv_self->head, kv_self->used, ubatch.n_tokens);
                 kv_self->head = 0;
             }
 
+            // 내가추가 ----------------------------------------------------------------
             // KV 캐시에서 마이크로 배치를 위한 슬롯 찾기
-            const auto slot_info = kv_self->find_slot(ubatch);
+            // const auto slot_info = kv_self->find_slot(ubatch);
             
-            if (!slot_info) {
-                LLAMA_LOG_ERROR("%s: failed to prepare ubatch\n", __func__);
-                return -3;  // 슬롯 할당 실패
-            }
+            // if (!slot_info) {
+            //     LLAMA_LOG_ERROR("%s: failed to prepare ubatch\n", __func__);
+            //     return -3;  // 슬롯 할당 실패
+            // }
 
-            // 슬롯 정보 저장 (나중에 복원 가능하도록)
-            bg.save(slot_info);
+            // // 슬롯 정보 저장 (나중에 복원 가능하도록)
+            // bg.save(slot_info);
+
+            if (kv_self->allow_split) {
+                llama_kv_cache_slot_info_multi slot_multi = kv_self->find_slot_split(ubatch);
+                // off 랑 len 출력
+                std::string offs_str;
+                for (auto off : slot_multi.offs) {
+                    offs_str += std::to_string(off) + " ";
+                }
+                LLAMA_LOG_INFO("slot_multi.offs: %s\n", offs_str.c_str());
+
+                std::string lens_str;
+                for (auto len : slot_multi.lens) {
+                    lens_str += std::to_string(len) + " ";
+                }
+                LLAMA_LOG_INFO("slot_multi.lens: %s\n", lens_str.c_str());
+                if (!slot_multi) {
+                    LLAMA_LOG_ERROR("%s: failed to find split slot\n", __func__);
+                    return -3;
+                }
+                // kv cache 정보 출력 n, used, head
+                LLAMA_LOG_INFO("kv cache 정보 출력 n, used, head: %u, %u, %u\n", kv_self->n, kv_self->used, kv_self->head);
+                bg.save(slot_multi);          // 오버로드 된 save() 호출
+            } else {
+                llama_kv_cache_slot_info slot = kv_self->find_slot(ubatch);
+                if (!slot) {
+                    LLAMA_LOG_ERROR("%s: failed to find contig slot\n", __func__);
+                    return -3;
+                }
+                bg.save(slot);
+            }
+            // 내가추가 ----------------------------------------------------------------
 
             if (!kv_self->recurrent) {
                 // 휴리스틱: 캐시가 아직 완전히 활용되지 않았으면 전체 캐시에 어텐션하지 않음
@@ -1667,14 +1735,20 @@ int llama_context::decode(llama_batch & inp_batch) {
 
         // KV 링 버퍼 헤드 위치 업데이트
         {
-            // 처리된 토큰 수만큼 헤드 위치 증가
-            kv_self->head += ubatch.n_tokens;
+            // 내가추가 ----------------------------------------------------------------
+            // // 처리된 토큰 수만큼 헤드 위치 증가
+            // kv_self->head += ubatch.n_tokens;
 
-            // KV 캐시 헤드가 유효한 인덱스를 가리키도록 보장
-            // 크기를 초과하면 처음으로 돌아감 (순환 버퍼)
-            if (kv_self->head >= kv_self->size) {
-                kv_self->head = 0;
+            // // KV 캐시 헤드가 유효한 인덱스를 가리키도록 보장
+            // // 크기를 초과하면 처음으로 돌아감 (순환 버퍼)
+            // if (kv_self->head >= kv_self->size) {
+            //     kv_self->head = 0;
+            // }
+            if (!kv_self->allow_split) {
+                kv_self->head += ubatch.n_tokens;
+                if (kv_self->head >= kv_self->size) kv_self->head = 0;
             }
+            // 내가추가 ----------------------------------------------------------------
         }
 
         // 계산 그래프를 DOT 형식으로 덤프 (디버깅용, 주석 처리됨)

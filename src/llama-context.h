@@ -130,6 +130,8 @@ struct llama_context {
 
     //내가추가----------------------------------------
     friend const llama_kv_cache_unified * llama_get_kv_cache_unified(const llama_context * ctx);
+
+    void kv_cache_allow_split(bool enable);
     //----------------------------------------------------
 
 private:

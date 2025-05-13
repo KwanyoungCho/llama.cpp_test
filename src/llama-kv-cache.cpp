@@ -243,7 +243,7 @@ void llama_kv_cache_unified::clear() {
  */
 bool llama_kv_cache_unified::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     uint32_t new_head = size;
-
+    LLAMA_LOG_INFO("seq_rm 전 head: %u, used: %u\n", head, used);
     // 기본값 설정
     if (p0 < 0) {
         p0 = 0;
@@ -314,6 +314,7 @@ bool llama_kv_cache_unified::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (new_head != size && new_head < head) {
         head = new_head;
     }
+    LLAMA_LOG_INFO("seq_rm 후 head: %u, used: %u\n", head, used);
 
     return true;
 }
@@ -393,7 +394,7 @@ void llama_kv_cache_unified::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
  */
 void llama_kv_cache_unified::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
-
+    LLAMA_LOG_INFO("seq_keep 전 head: %u, used: %u\n", head, used);
     for (uint32_t i = 0; i < size; ++i) {
         // 순환 모델에서 유지할 seq_id 외의 모든 테일 정보 제거
         if (recurrent && (llama_seq_id) i != seq_id) {
@@ -425,6 +426,7 @@ void llama_kv_cache_unified::seq_keep(llama_seq_id seq_id) {
     if (new_head != size && new_head < head) {
         head = new_head;
     }
+    LLAMA_LOG_INFO("seq_keep 후 head: %u, used: %u\n", head, used);
 }
 
 /**
@@ -807,6 +809,7 @@ llama_kv_cache_slot_info llama_kv_cache_unified::find_slot(
         return llama_kv_cache_slot_info(n >= n_seqs);
     }
 
+    // recurrent가 아니면 여기부터 시작!!!
     // 트랜스포머 모델용: 토큰당 하나의 셀 사용
     // 순환 모델과 달리 각 토큰이 별도의 캐시 셀을 필요로 함
 
@@ -871,6 +874,114 @@ llama_kv_cache_slot_info llama_kv_cache_unified::find_slot(
     // 슬롯 정보 반환 (시작과 끝 위치)
     return llama_kv_cache_slot_info(head, head + n_tokens);
 }
+
+// 내가추가 ----------------------------------------------------------------
+llama_kv_cache_slot_info_multi llama_kv_cache_unified::find_slot_split(const llama_ubatch & ubatch) {
+    llama_kv_cache_slot_info_multi out;               // return struct
+    const uint32_t n_tokens     = ubatch.n_tokens;
+    const uint32_t n_seqs       = ubatch.n_seqs;
+    const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    //----------------------------------------------------------------
+    // 0. 예외: 순환 모델은 연속 슬롯만 지원 → 실패 반환
+    //----------------------------------------------------------------
+    if (recurrent || n_tokens == 0) {
+        return out;                              // total==0  → 실패
+    }
+
+    //----------------------------------------------------------------
+    // 1. 용량 체크
+    //----------------------------------------------------------------
+    if (n_tokens > size) {
+        LLAMA_LOG_ERROR("%s: need %u slots, cache size %u\n",
+                        __func__, n_tokens, size);
+        return out;
+    }
+
+    //----------------------------------------------------------------
+    // 2. 링 버퍼 스캔하여 greedy 로 hole 조합
+    //----------------------------------------------------------------
+    uint32_t scan    = head;        // 현재 스캔 위치
+    uint32_t visited = 0;           // 순회한 셀 수
+    uint32_t need    = n_tokens;    // 아직 필요한 슬롯 수
+
+    while (need && visited < size) {
+
+        //------------------------ 빈 구간 길이 측정 ------------------
+        uint32_t hole = 0;
+        while (hole < size &&
+               cells[(scan + hole) % size].pos < 0) {      // 비어있다
+            ++hole;
+        }
+
+        if (hole == 0) {               // 현재 셀이 사용중
+            ++scan; ++visited;
+            continue;
+        }
+
+        uint32_t seg_len = std::min(hole, need);
+
+        out.offs.push_back(scan % size);
+        out.lens.push_back(seg_len);
+        out.total += seg_len;
+
+        // 진행
+        need    -= seg_len;
+        scan    += seg_len;            // hole 내부 이동
+        visited += seg_len;
+
+        // hole이 seg_len보다 길었다면(need=0이면) scan 을 hole 끝으로
+        if (need == 0) {
+            scan += (hole - seg_len);
+            visited += (hole - seg_len);
+        }
+    }
+
+    //----------------------------------------------------------------
+    // 3. 공간 부족 시 실패
+    //----------------------------------------------------------------
+    if (need) {                        // 아직 남았다 ⇒ 캐시 full
+        out.offs.clear(); out.lens.clear(); out.total = 0;
+        return out;
+    }
+
+    //----------------------------------------------------------------
+    // 4. 메타데이터( pos / seq_id / tail ) 채우기
+    //----------------------------------------------------------------
+    uint32_t token_cursor = 0;
+    for (size_t seg = 0; seg < out.offs.size(); ++seg) {
+        uint32_t off = out.offs[seg];
+        uint32_t len = out.lens[seg];
+
+        for (uint32_t i = 0; i < len; ++i, ++token_cursor) {
+
+            uint32_t cell_idx = (off + i) % size;
+            llama_kv_cell & cell = cells[cell_idx];
+
+            // ① pos
+            cell.pos = ubatch.pos[token_cursor];
+
+            // ② seq_id set + 각 seq tail 업데이트
+            uint32_t seq_block  = token_cursor / n_seq_tokens;   // 0 .. n_seqs-1
+            cell.seq_id.clear();
+            for (int32_t j = 0; j < ubatch.n_seq_id[seq_block]; ++j) {
+                llama_seq_id sid = ubatch.seq_id[seq_block][j];
+                cell.seq_id.insert(sid);
+                cells[sid].tail = cell_idx;
+            }
+        }
+    }
+
+    //----------------------------------------------------------------
+    // 5. 캐시 헤드·사용량 갱신
+    //----------------------------------------------------------------
+    head = (out.offs.back() + out.lens.back()) % size;  // 마지막 세그 끝 다음
+    used += n_tokens;
+
+    return out;    // .total == n_tokens  ⇒ 성공
+}
+
+// ----------------------------------------------------------------
 
 /**
  * Flash Attention 커널에 필요한 패딩 크기 반환

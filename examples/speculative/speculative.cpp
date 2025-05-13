@@ -93,6 +93,10 @@ int main(int argc, char ** argv) {
     model_tgt = llama_init_tgt.model.get();
     ctx_tgt   = llama_init_tgt.context.get();
 
+    // 내가추가 ----------------------------------------------------------------
+    allow_split(ctx_tgt, true);
+    // ----------------------------------------------------------------
+
     // 드래프트 모델 로드를 위한 파라미터 설정
     params.devices = params.speculative.devices;
     params.model = params.speculative.model;
@@ -255,7 +259,7 @@ int main(int argc, char ** argv) {
             active_seqs.insert(s);
             const auto & tokens = drafts[s].tokens;
 
-            LOG_DBG("draft %d: %s\n", s, string_from(ctx_dft, tokens).c_str());
+            // LOG_DBG("draft %d: %s\n", s, string_from(ctx_dft, tokens).c_str());
         }
 
         int i_dft  = 0;  // 드래프트 토큰 인덱스
@@ -265,9 +269,9 @@ int main(int argc, char ** argv) {
         std::string token_str;  // 생성된 토큰 문자열 표현
 
         // 드래프트 토큰이 더 이상 없거나 토큰 검증에 실패할 때까지 반복
-        // LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n");
-        // LOG_DBG("   sampling 단계 \n");
-        // LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
+        LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n");
+        LOG_DBG("   sampling 단계 \n");
+        LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
         while (true) {
             // 타겟 모델의 토큰이 드래프트 시퀀스와 일치하는지 확인
             // 확률적 샘플링의 경우, 드래프트 토큰과 타겟 토큰의 매칭 시도
@@ -481,30 +485,30 @@ int main(int argc, char ** argv) {
 
             // TODO: simplify
             {   
-                // LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
-                // LOG_DBG("KV cache 정리 단계 \n");
-                // LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
+                LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
+                LOG_DBG("KV cache 정리 단계 \n");
+                LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
                 
                 // LOG_DBG("keeping sequence %d, n_past_tgt = %d, n_past_dft = %d\n", s_keep, n_past_tgt, n_past_dft);
                 
                 //내가추가--------------------------------------
-                // LOG_DBG("\n--- 정리하기 전 draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str()); // draft kv cache
+                LOG_DBG("\n--- 정리하기 전 draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str()); // draft kv cache
 
                 // KV 캐시를 정리하고 유지할 시퀀스만 보존
                 llama_kv_self_seq_keep(ctx_dft, s_keep);
                 // LOG_DBG("\n--- 선택한 seq만 남김 : draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str()); // draft kv cache
                 llama_kv_self_seq_cp  (ctx_dft, s_keep, 0, -1, -1);
                 llama_kv_self_seq_keep(ctx_dft, 0);
-                // LOG_DBG("\n--- seq를 0으로 변경 : draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str()); // draft kv cache
+                LOG_DBG("\n--- seq를 0으로 변경 : draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str()); // draft kv cache
                 
-                // LOG_DBG("\n--- 정리하기 전 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
+                LOG_DBG("\n--- 정리하기 전 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
                 llama_kv_self_seq_rm  (ctx_tgt, s_keep, n_past_tgt, -1);
                 // LOG_DBG("\n--- reject seq 제거 : target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
                 llama_kv_self_seq_keep(ctx_tgt, s_keep);
                 // LOG_DBG("\n--- keep seq 남김 : target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
                 llama_kv_self_seq_cp  (ctx_tgt, s_keep, 0, -1, -1);
                 llama_kv_self_seq_keep(ctx_tgt, 0);
-                // LOG_DBG("\n--- seq를 0으로 변경 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
+                LOG_DBG("\n--- seq를 0으로 변경 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
             }
 
             //내가추가--------------------------------------
@@ -540,9 +544,9 @@ int main(int argc, char ** argv) {
 
 
             //내가추가--------------------------------------
-            // LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
-            // LOG_DBG("draft KV cache에 bonus token 추가 \n");
-            // LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
+            LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
+            LOG_DBG("draft KV cache에 bonus token 추가 \n");
+            LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
             // LOG_DBG("정리하기 전 draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str()); // draft kv cache
             // 드래프트 모델의 KV 캐시에서 불필요한 부분 제거
             llama_kv_self_seq_rm(ctx_dft, 0, n_past_dft, -1);
@@ -586,9 +590,9 @@ int main(int argc, char ** argv) {
         common_batch_add  (batch_tgt, drafts[0].tokens[0], n_past_tgt, { 0 }, true);
 
         //내가추가--------------------------------------
-        // LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
-        // LOG_DBG("drafting 단계 \n");
-        // LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
+        LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
+        LOG_DBG("drafting 단계 \n");
+        LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
         
 
         // 트리 기반 샘플링을 사용하여 드래프트 모델에서 n_draft 개의 토큰 샘플링
@@ -719,9 +723,9 @@ int main(int argc, char ** argv) {
         }
 
         // 타겟 모델에서 드래프트된 토큰 평가
-        // LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
-        // LOG_DBG("target 모델에서 드래프트된 토큰 평가 \n");
-        // LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
+        LOG_DBG("\n///////////////////////////////////////////////////////////////////////////// \n");
+        LOG_DBG("target 모델에서 드래프트된 토큰 평가 \n");
+        LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
         {
             // LOG_DBG("\n--- 정리하기 전 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
             // KV 캐시 준비: 첫 번째 시퀀스만 유지하고 나머지 시퀀스에 복사
@@ -742,7 +746,7 @@ int main(int argc, char ** argv) {
             // LOG_DBG("target decode time: %f ms\n", decode_time_ms);
             // 디코딩 시간 저장
             // save_decode_time(n_past_tgt, decode_time_ms, ctx_tgt);
-            // LOG_DBG("\n--- 드래프트된 토큰 평가 완료 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
+            LOG_DBG("\n--- 드래프트된 토큰 평가 완료 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
             ++n_past_tgt;  // 타겟 모델 컨텍스트 위치 증가
             
         }

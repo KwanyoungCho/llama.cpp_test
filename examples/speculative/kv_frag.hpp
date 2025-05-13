@@ -267,3 +267,9 @@ inline void save_decode_time(int n_past_tgt,           // 타겟 모델 컨텍�
     std::fprintf(fp, "%d,%.3f,%d\n", n_past_tgt, decode_time_ms, do_defrag);
     std::fclose(fp);
 }
+
+
+// allow_split 플래그 설정
+inline void allow_split(llama_context * ctx, bool enable) {
+    ctx->kv_cache_allow_split(enable);
+}
