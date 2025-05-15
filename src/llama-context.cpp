@@ -1652,7 +1652,7 @@ int llama_context::decode(llama_batch & inp_batch) {
 
             // // 슬롯 정보 저장 (나중에 복원 가능하도록)
             // bg.save(slot_info);
-
+            LLAMA_LOG_INFO("find_slot 이전 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
             if (kv_self->allow_split) {
                 llama_kv_cache_slot_info_multi slot_multi = kv_self->find_slot_split(ubatch);
                 // off 랑 len 출력
@@ -1671,9 +1671,11 @@ int llama_context::decode(llama_batch & inp_batch) {
                     LLAMA_LOG_ERROR("%s: failed to find split slot\n", __func__);
                     return -3;
                 }
-                // kv cache 정보 출력 n, used, head
-                LLAMA_LOG_INFO("kv cache 정보 출력 n, used, head: %u, %u, %u\n", kv_self->n, kv_self->used, kv_self->head);
+                // // kv cache 정보 출력 n, used, head
+                // LLAMA_LOG_INFO("kv cache 정보 출력 n, used, head: %u, %u, %u\n", kv_self->n, kv_self->used, kv_self->head);
                 bg.save(slot_multi);          // 오버로드 된 save() 호출
+                kv_self->last_slot_multi = slot_multi;
+                bg.save(slot_multi);
             } else {
                 llama_kv_cache_slot_info slot = kv_self->find_slot(ubatch);
                 if (!slot) {
@@ -1682,7 +1684,7 @@ int llama_context::decode(llama_batch & inp_batch) {
                 }
                 bg.save(slot);
             }
-            // 내가추가 ----------------------------------------------------------------
+            LLAMA_LOG_INFO("find_slot 이후 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
 
             if (!kv_self->recurrent) {
                 // 휴리스틱: 캐시가 아직 완전히 활용되지 않았으면 전체 캐시에 어텐션하지 않음
@@ -1691,6 +1693,8 @@ int llama_context::decode(llama_batch & inp_batch) {
                 const uint32_t pad = kv_self->get_padding(cparams);
                 kv_self->n = std::min(kv_self->size, std::max(pad, GGML_PAD(kv_self->cell_max(), pad)));
             }
+            // 내가추가 ----------------------------------------------------------------
+            LLAMA_LOG_INFO("n 재설정 이후 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
         }
 
         // KV 캐시 상태 디버깅용 (주석 처리됨)
@@ -1699,7 +1703,8 @@ int llama_context::decode(llama_batch & inp_batch) {
         // 스케줄러 초기화 및 평가 콜백 설정
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
-
+        
+        LLAMA_LOG_INFO("Graph 실행!!!\n");
         // 계산 그래프 초기화
         auto * gf = graph_init();
         // 디코더 타입의 계산 그래프 구축
@@ -1747,7 +1752,11 @@ int llama_context::decode(llama_batch & inp_batch) {
             if (!kv_self->allow_split) {
                 kv_self->head += ubatch.n_tokens;
                 if (kv_self->head >= kv_self->size) kv_self->head = 0;
+            } else {
+                const auto & multi = kv_self->last_slot_multi;
+                kv_self->head = (multi.offs.back() + multi.lens.back()) % kv_self->size;
             }
+            LLAMA_LOG_INFO("head 업데이트 이후 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
             // 내가추가 ----------------------------------------------------------------
         }
 

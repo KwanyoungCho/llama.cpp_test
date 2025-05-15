@@ -243,7 +243,7 @@ void llama_kv_cache_unified::clear() {
  */
 bool llama_kv_cache_unified::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     uint32_t new_head = size;
-    LLAMA_LOG_INFO("seq_rm 전 head: %u, used: %u\n", head, used);
+    // LLAMA_LOG_INFO("seq_rm 전 head: %u, used: %u\n", head, used);
     // 기본값 설정
     if (p0 < 0) {
         p0 = 0;
@@ -314,7 +314,7 @@ bool llama_kv_cache_unified::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (new_head != size && new_head < head) {
         head = new_head;
     }
-    LLAMA_LOG_INFO("seq_rm 후 head: %u, used: %u\n", head, used);
+    // LLAMA_LOG_INFO("seq_rm 후 head: %u, used: %u\n", head, used);
 
     return true;
 }
@@ -385,6 +385,7 @@ void llama_kv_cache_unified::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cells[i].seq_id.insert(seq_id_dst);
         }
     }
+    // LLAMA_LOG_INFO("seq_cp 후 head: %u, used: %u\n", head, used);
 }
 
 /**
@@ -394,7 +395,7 @@ void llama_kv_cache_unified::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
  */
 void llama_kv_cache_unified::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
-    LLAMA_LOG_INFO("seq_keep 전 head: %u, used: %u\n", head, used);
+    // LLAMA_LOG_INFO("seq_keep 전 head: %u, used: %u\n", head, used);
     for (uint32_t i = 0; i < size; ++i) {
         // 순환 모델에서 유지할 seq_id 외의 모든 테일 정보 제거
         if (recurrent && (llama_seq_id) i != seq_id) {
@@ -426,7 +427,7 @@ void llama_kv_cache_unified::seq_keep(llama_seq_id seq_id) {
     if (new_head != size && new_head < head) {
         head = new_head;
     }
-    LLAMA_LOG_INFO("seq_keep 후 head: %u, used: %u\n", head, used);
+    // LLAMA_LOG_INFO("seq_keep 후 head: %u, used: %u\n", head, used);
 }
 
 /**
@@ -612,6 +613,7 @@ llama_kv_cache_slot_info llama_kv_cache_unified::find_slot(
     const uint32_t n_seqs   = ubatch.n_seqs;
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
 
+#if 0
     if (recurrent) {
         // 순환 모델(Mamba, RWKV 등)의 경우,
         // 각 캐시 셀이 전체 시퀀스 상태를 저장할 수 있음
@@ -808,7 +810,7 @@ llama_kv_cache_slot_info llama_kv_cache_unified::find_slot(
         // 무결성 검사: 사용된 셀 수가 시퀀스 수 이상인지 확인
         return llama_kv_cache_slot_info(n >= n_seqs);
     }
-
+#endif
     // recurrent가 아니면 여기부터 시작!!!
     // 트랜스포머 모델용: 토큰당 하나의 셀 사용
     // 순환 모델과 달리 각 토큰이 별도의 캐시 셀을 필요로 함
@@ -937,6 +939,8 @@ llama_kv_cache_slot_info_multi llama_kv_cache_unified::find_slot_split(const lla
         }
     }
 
+    assert(out.total == n_tokens);
+
     //----------------------------------------------------------------
     // 3. 공간 부족 시 실패
     //----------------------------------------------------------------
@@ -975,7 +979,10 @@ llama_kv_cache_slot_info_multi llama_kv_cache_unified::find_slot_split(const lla
     //----------------------------------------------------------------
     // 5. 캐시 헤드·사용량 갱신
     //----------------------------------------------------------------
-    head = (out.offs.back() + out.lens.back()) % size;  // 마지막 세그 끝 다음
+    // head = (out.offs.back() + out.lens.back()) % size;  // head는 graph 실행 이후에 업데이트 되어야함
+    if (!out.offs.empty()) {
+        head = out.offs[0];
+    }
     used += n_tokens;
 
     return out;    // .total == n_tokens  ⇒ 성공

@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstring>
 
+#include <numeric>
+
 static int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
     // TODO move to hparams if a T5 variant appears that uses a different value
     const int64_t max_distance = 128;
@@ -1394,6 +1396,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * kq_b,
             float     kq_scale,
             int       il) const {
+    // LLAMA_LOG_INFO("build_attn 시작\n");
     // 노드 재정렬 방지를 위해 Q, K, V 텐서를 함께 그래프에 추가
     // 이렇게 하면 그래프의 분할(split) 수가 줄어들어 성능 향상
     ggml_build_forward_expand(gf, q_cur);
@@ -1405,6 +1408,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // 컨텍스트 길이 (캐시 크기와 일치해야 함)
     const auto & n_ctx = cparams.n_ctx;
 
+#if 0
     // 레이어별 GQA(Grouped Query Attention) K, V 임베딩 차원
     const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
     const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
@@ -1414,6 +1418,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // Value 텐서 전치 여부 (Flash Attention 사용 시 전치하지 않음)
     const bool v_trans = !cparams.flash_attn;
+
 
     // 새 토큰의 K, V 값을 KV 캐시에 저장하는 부분
     {
@@ -1430,7 +1435,10 @@ ggml_tensor * llm_graph_context::build_attn(
         // n_tokens*n_embd_k_gqa 크기의 연속적인 메모리 블록을 kv_head 위치부터 선택
         ggml_tensor * k_cache_view = ggml_view_1d(ctx0, kv_self->k_l[il], n_tokens*n_embd_k_gqa, ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa)*kv_head);
         //cb(k_cache_view, "k_cache_view", il);
-
+        // LLAMA_LOG_INFO("n_tokens: %ld, n_embd_k_gqa: %ld, kv_head: %d\n", n_tokens, n_embd_k_gqa, kv_head);
+        LLAMA_LOG_INFO("k_cur: %ld, %ld, %ld, %ld\n", k_cur->ne[0], k_cur->ne[1], k_cur->ne[2], k_cur->ne[3]);
+        LLAMA_LOG_INFO("k_cache_view: %ld, %ld, %ld, %ld\n", k_cache_view->ne[0], k_cache_view->ne[1], k_cache_view->ne[2], k_cache_view->ne[3]);
+        
         // 현재 토큰의 K 값(RoPE 적용 후)을 KV 캐시에 복사
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cur, k_cache_view));
 
@@ -1447,18 +1455,193 @@ ggml_tensor * llm_graph_context::build_attn(
         } else {
             // Flash Attention 미사용 시: 전치된 2D 뷰 사용
             // V 캐시는 [n_tokens, n_embd_v_gqa] 형태로 저장
+            // LLAMA_LOG_INFO("flash_attn 사용 시\n");
             v_cache_view = ggml_view_2d(ctx0, kv_self->v_l[il], n_tokens, n_embd_v_gqa,
                     (  n_ctx)*ggml_element_size(kv_self->v_l[il]),
                     (kv_head)*ggml_element_size(kv_self->v_l[il]));
 
+            LLAMA_LOG_INFO("v_cur: %ld, %ld, %ld, %ld\n", v_cur->ne[0], v_cur->ne[1], v_cur->ne[2], v_cur->ne[3]);
+            LLAMA_LOG_INFO("v_cache_view: %ld, %ld, %ld, %ld\n", v_cache_view->ne[0], v_cache_view->ne[1], v_cache_view->ne[2], v_cache_view->ne[3]);
+
             // V 텐서 전치 (Flash Attention 미사용 시 필요)
             v_cur = ggml_transpose(ctx0, v_cur);
+            LLAMA_LOG_INFO("v_cur_trans: %ld, %ld, %ld, %ld\n", v_cur->ne[0], v_cur->ne[1], v_cur->ne[2], v_cur->ne[3]);
         }
         //cb(v_cache_view, "v_cache_view", il);
 
         // 현재 토큰의 V 값을 KV 캐시에 복사
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_cur, v_cache_view));
     }
+#endif
+        // 내가 추가 --------------------------------
+#if 1
+    GGML_ASSERT(!kv_self->recurrent);
+    const auto n_tokens       = q_cur->ne[2];
+    const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+    const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+    const bool    v_trans      = !cparams.flash_attn;
+
+    if (kv_self->allow_split && kv_self->last_slot_multi) {
+        const auto & multi = kv_self->last_slot_multi;
+        // // // off랑 len 출력
+        std::string offs_str;
+        for (auto off : multi.offs) {
+            offs_str += std::to_string(off) + " ";
+        }
+        // LLAMA_LOG_INFO("slot_multi.offs: %s\n", offs_str.c_str());
+
+        std::string lens_str;
+        for (auto len : multi.lens) {
+            lens_str += std::to_string(len) + " ";
+        }
+        // LLAMA_LOG_INFO("slot_multi.lens: %s\n", lens_str.c_str());
+
+        // LLAMA_LOG_INFO("kv_head: %u\n", kv_self->head);
+        // const auto n_tokens = q_cur->ne[2];
+        // LLAMA_LOG_INFO("n_tokens: %ld\n", n_tokens);
+        // LLAMA_LOG_INFO("off.size(): %ld\n", multi.offs.size());
+        // ★ token_cursor를 0부터 len만큼 누적
+        uint32_t token_cursor = 0;
+
+        // 필요한 stride(바이트) 계산
+        const size_t k_cache_stride = ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa);
+        const size_t v_cache_stride = v_trans 
+            ? ggml_element_size(kv_self->v_l[il]) * n_ctx  // 전치된 경우
+            : ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa);  // 전치되지 않은 경우
+        const size_t v_cur_stride = ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa);
+
+        assert(multi.offs.size() == multi.lens.size());
+        assert(kv_self->head == multi.offs[0]);
+        // 세그먼트 총 합이 n_tokens 이어야 함
+        assert(n_tokens == std::accumulate(multi.lens.begin(), multi.lens.end(), 0));
+        
+        for (size_t s = 0; s < multi.offs.size(); ++s) {
+            const uint32_t slot = multi.offs[s];
+            const uint32_t len  = multi.lens[s];
+
+            // --- K 복사 ---
+            {
+                // KV 캐시에서 slot 위치로 view
+                ggml_tensor * k_cache_seg = ggml_view_1d(
+                    ctx0, kv_self->k_l[il],
+                    /* ne = */ (int64_t)len * n_embd_k_gqa,
+                    /* offset = */ k_cache_stride * slot
+                );
+
+                ggml_tensor * k_cur_seg = ggml_view_3d(
+                    ctx0, k_cur,
+                    /* ne0 = */ k_cur->ne[0],
+                    /* ne1 = */ k_cur->ne[1],
+                    /* ne2 = */ (int64_t)len,
+                    /*nb1 = */ k_cur->nb[1],
+                    /*nb2 = */ k_cur->nb[2],
+                    /* offset = */ k_cache_stride * token_cursor
+                );
+                
+
+                // k_cur 정보 출력
+                // LLAMA_LOG_INFO("k_cur: %ld, %ld, %ld, %ld\n", k_cur->ne[0], k_cur->ne[1], k_cur->ne[2], k_cur->ne[3]);
+                // k_cur_seg 정보 출력
+                // LLAMA_LOG_INFO("k_cur_seg: %ld, %ld, %ld, %ld\n", k_cur_seg->ne[0], k_cur_seg->ne[1], k_cur_seg->ne[2], k_cur_seg->ne[3]);
+                // k_cache_seg 정보 출력
+                // LLAMA_LOG_INFO("k_cache_seg: %ld, %ld, %ld, %ld\n", k_cache_seg->ne[0], k_cache_seg->ne[1], k_cache_seg->ne[2], k_cache_seg->ne[3]);
+
+                ggml_build_forward_expand(gf,
+                    ggml_cpy(ctx0, k_cur_seg, k_cache_seg)
+                );
+            }
+
+            // --- V 복사 ---
+            {
+                ggml_tensor * v_cache_seg = nullptr;
+                if (!v_trans) {
+                    v_cache_seg = ggml_view_1d(
+                        ctx0, kv_self->v_l[il],
+                        /* ne0 = */ (int64_t)len * n_embd_v_gqa,
+                        /* offset = */ v_cache_stride * slot
+                    );
+                } else {
+                    v_cache_seg = ggml_view_2d(
+                        ctx0, kv_self->v_l[il],
+                        /* ne0 = */ (int64_t)len,
+                        /* ne1 = */ n_embd_v_gqa,
+                        /* nb1 = */ n_ctx * ggml_element_size(kv_self->v_l[il]),
+                        /* offset = */ slot * ggml_element_size(kv_self->v_l[il])
+                    );
+                }
+
+                // 입력 v_cur에서 token_cursor 위치로 view
+                ggml_tensor * v_cur_seg = ggml_view_2d(
+                    ctx0, v_cur,
+                    /* ne0 = */ v_cur->ne[0],
+                    /* ne1 = */ (int64_t)len,
+                    /* nb1 = */ v_cur->nb[1],
+                    /* offset = */ v_cur_stride * token_cursor
+                );
+
+                // v_cur 길이 출력
+                // LLAMA_LOG_INFO("v_cur: %ld, %ld, %ld, %ld\n", v_cur->ne[0], v_cur->ne[1], v_cur->ne[2], v_cur->ne[3]);
+                // v_cur_seg 정보 출력
+                // LLAMA_LOG_INFO("v_cur_seg: %ld, %ld, %ld, %ld\n", v_cur_seg->ne[0], v_cur_seg->ne[1], v_cur_seg->ne[2], v_cur_seg->ne[3]);
+                // v_cache_seg 정보 출력
+                // LLAMA_LOG_INFO("v_cache_seg: %ld, %ld, %ld, %ld\n", v_cache_seg->ne[0], v_cache_seg->ne[1], v_cache_seg->ne[2], v_cache_seg->ne[3]);
+
+                if (v_trans) {
+                    v_cur_seg = ggml_transpose(ctx0, v_cur_seg);
+                    // v_cur = ggml_transpose(ctx0, v_cur);
+                    // LLAMA_LOG_INFO("v_cur_seg_trans: %ld, %ld, %ld, %ld\n", v_cur_seg->ne[0], v_cur_seg->ne[1], v_cur_seg->ne[2], v_cur_seg->ne[3]);
+                }
+
+                ggml_build_forward_expand(gf,
+                    ggml_cpy(ctx0, v_cur_seg, v_cache_seg)
+                );
+            }
+
+            // 다음 세그먼트로 이동
+            LLAMA_LOG_INFO("token_cursor: %u\n", token_cursor);
+            token_cursor += len;
+        }
+        // split 모드일 때는 head/used 는 이미 find_slot_split 에서 업데이트되었습니다.
+
+    } else {
+        // → contiguous 모드: 기존 로직 그대로
+        const auto kv_head = kv_self->head;
+        // LLAMA_LOG_INFO("kv_head: %u\n", kv_head);
+        // K
+        ggml_tensor * k_cache_view = ggml_view_1d(
+            ctx0,
+            kv_self->k_l[il],
+            n_tokens * n_embd_k_gqa,
+            ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa) * kv_head
+        );
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0, k_cur, k_cache_view)
+        );
+
+        // V
+        ggml_tensor * v_cache_view = nullptr;
+        if (!v_trans) {
+            v_cache_view = ggml_view_1d(
+                ctx0,
+                kv_self->v_l[il],
+                n_tokens * n_embd_v_gqa,
+                ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa) * kv_head
+            );
+        } else {
+            v_cache_view = ggml_view_2d(
+                ctx0, kv_self->v_l[il],
+                /*ne0=*/ n_tokens, /*ne1=*/ n_embd_v_gqa,
+                /*stride0=*/ n_ctx * ggml_element_size(kv_self->v_l[il]),
+                /*stride1=*/ kv_head * ggml_element_size(kv_self->v_l[il])
+            );
+            v_cur = ggml_transpose(ctx0, v_cur);
+        }
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0, v_cur, v_cache_view)
+        );
+    }
+#endif
+    //--------------------------------
 
     // 슬라이딩 윈도우 어텐션(SWA) 사용 여부 확인
     const bool is_swa = hparams.is_swa(il);

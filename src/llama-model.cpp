@@ -4036,6 +4036,7 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
 
 struct llm_build_llama : public llm_graph_context {
     llm_build_llama(const llama_model & model, const llm_graph_params & params, ggml_cgraph * gf) : llm_graph_context(params) {
+        LLAMA_LOG_INFO("llm_build_llama 시작\n");
         const int64_t n_embd_head = hparams.n_embd_head_v;
 
         // 확인: 키와 값의 임베딩 차원이 동일한지 확인
