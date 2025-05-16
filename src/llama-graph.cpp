@@ -1484,16 +1484,16 @@ ggml_tensor * llm_graph_context::build_attn(
     if (kv_self->allow_split && kv_self->last_slot_multi) {
         const auto & multi = kv_self->last_slot_multi;
         // // // off랑 len 출력
-        std::string offs_str;
-        for (auto off : multi.offs) {
-            offs_str += std::to_string(off) + " ";
-        }
-        // LLAMA_LOG_INFO("slot_multi.offs: %s\n", offs_str.c_str());
+        // std::string offs_str;
+        // for (auto off : multi.offs) {
+        //     offs_str += std::to_string(off) + " ";
+        // }
+        // // LLAMA_LOG_INFO("slot_multi.offs: %s\n", offs_str.c_str());
 
-        std::string lens_str;
-        for (auto len : multi.lens) {
-            lens_str += std::to_string(len) + " ";
-        }
+        // std::string lens_str;
+        // for (auto len : multi.lens) {
+        //     lens_str += std::to_string(len) + " ";
+        // }
         // LLAMA_LOG_INFO("slot_multi.lens: %s\n", lens_str.c_str());
 
         // LLAMA_LOG_INFO("kv_head: %u\n", kv_self->head);
@@ -1504,17 +1504,17 @@ ggml_tensor * llm_graph_context::build_attn(
         uint32_t token_cursor = 0;
 
         // 필요한 stride(바이트) 계산
-        const size_t k_cache_stride = ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa);
-        const size_t v_cache_stride = v_trans 
-            ? ggml_element_size(kv_self->v_l[il]) * n_ctx  // 전치된 경우
-            : ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa);  // 전치되지 않은 경우
-        const size_t v_cur_stride = ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa);
+        // const size_t k_cache_stride = ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa);
+        // const size_t v_cache_stride = v_trans 
+        //     ? ggml_element_size(kv_self->v_l[il]) * n_ctx  // 전치된 경우
+        //     : ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa);  // 전치되지 않은 경우
+        // const size_t v_cur_stride = ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa);
 
         assert(multi.offs.size() == multi.lens.size());
         assert(kv_self->head == multi.offs[0]);
         // 세그먼트 총 합이 n_tokens 이어야 함
         assert(n_tokens == std::accumulate(multi.lens.begin(), multi.lens.end(), 0));
-        
+
         for (size_t s = 0; s < multi.offs.size(); ++s) {
             const uint32_t slot = multi.offs[s];
             const uint32_t len  = multi.lens[s];
@@ -1525,7 +1525,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 ggml_tensor * k_cache_seg = ggml_view_1d(
                     ctx0, kv_self->k_l[il],
                     /* ne = */ (int64_t)len * n_embd_k_gqa,
-                    /* offset = */ k_cache_stride * slot
+                    /* offset = */ slot * ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa)
                 );
 
                 ggml_tensor * k_cur_seg = ggml_view_3d(
@@ -1535,9 +1535,8 @@ ggml_tensor * llm_graph_context::build_attn(
                     /* ne2 = */ (int64_t)len,
                     /*nb1 = */ k_cur->nb[1],
                     /*nb2 = */ k_cur->nb[2],
-                    /* offset = */ k_cache_stride * token_cursor
+                    /* offset = */ token_cursor * ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa)
                 );
-                
 
                 // k_cur 정보 출력
                 // LLAMA_LOG_INFO("k_cur: %ld, %ld, %ld, %ld\n", k_cur->ne[0], k_cur->ne[1], k_cur->ne[2], k_cur->ne[3]);
@@ -1558,7 +1557,7 @@ ggml_tensor * llm_graph_context::build_attn(
                     v_cache_seg = ggml_view_1d(
                         ctx0, kv_self->v_l[il],
                         /* ne0 = */ (int64_t)len * n_embd_v_gqa,
-                        /* offset = */ v_cache_stride * slot
+                        /* offset = */ slot * ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa)
                     );
                 } else {
                     v_cache_seg = ggml_view_2d(
@@ -1576,11 +1575,11 @@ ggml_tensor * llm_graph_context::build_attn(
                     /* ne0 = */ v_cur->ne[0],
                     /* ne1 = */ (int64_t)len,
                     /* nb1 = */ v_cur->nb[1],
-                    /* offset = */ v_cur_stride * token_cursor
+                    /* offset = */ token_cursor * ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa)
                 );
 
                 // v_cur 길이 출력
-                // LLAMA_LOG_INFO("v_cur: %ld, %ld, %ld, %ld\n", v_cur->ne[0], v_cur->ne[1], v_cur->ne[2], v_cur->ne[3]);
+                LLAMA_LOG_INFO("v_cur: %ld, %ld, %ld, %ld\n", v_cur->ne[0], v_cur->ne[1], v_cur->ne[2], v_cur->ne[3]);
                 // v_cur_seg 정보 출력
                 // LLAMA_LOG_INFO("v_cur_seg: %ld, %ld, %ld, %ld\n", v_cur_seg->ne[0], v_cur_seg->ne[1], v_cur_seg->ne[2], v_cur_seg->ne[3]);
                 // v_cache_seg 정보 출력
@@ -1598,7 +1597,7 @@ ggml_tensor * llm_graph_context::build_attn(
             }
 
             // 다음 세그먼트로 이동
-            LLAMA_LOG_INFO("token_cursor: %u\n", token_cursor);
+            // LLAMA_LOG_INFO("token_cursor: %u\n", token_cursor);
             token_cursor += len;
         }
         // split 모드일 때는 head/used 는 이미 find_slot_split 에서 업데이트되었습니다.
