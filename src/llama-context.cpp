@@ -1636,8 +1636,8 @@ int llama_context::decode(llama_batch & inp_batch) {
             // 현재 헤드 위치 이전에 충분한 미사용 셀이 있으면
             // 캐시 시작부터 채우기 위해 헤드 위치 재설정
             if (kv_self->head > kv_self->used + 2*ubatch.n_tokens) {
-                LLAMA_LOG_INFO("head 위치를 0으로 변경");
-                LLAMA_LOG_INFO("kv_self->head: %u, kv_self->used: %u, ubatch.n_tokens: %u\n", kv_self->head, kv_self->used, ubatch.n_tokens);
+                // LLAMA_LOG_INFO("head 위치를 0으로 변경");
+                // LLAMA_LOG_INFO("kv_self->head: %u, kv_self->used: %u, ubatch.n_tokens: %u\n", kv_self->head, kv_self->used, ubatch.n_tokens);
                 kv_self->head = 0;
             }
 
@@ -1652,7 +1652,7 @@ int llama_context::decode(llama_batch & inp_batch) {
 
             // // 슬롯 정보 저장 (나중에 복원 가능하도록)
             // bg.save(slot_info);
-            LLAMA_LOG_INFO("find_slot 이전 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
+            // LLAMA_LOG_INFO("find_slot 이전 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
             if (kv_self->allow_split) {
                 llama_kv_cache_slot_info_multi slot_multi = kv_self->find_slot_split(ubatch);
                 // off 랑 len 출력
@@ -1660,13 +1660,13 @@ int llama_context::decode(llama_batch & inp_batch) {
                 for (auto off : slot_multi.offs) {
                     offs_str += std::to_string(off) + " ";
                 }
-                LLAMA_LOG_INFO("slot_multi.offs: %s\n", offs_str.c_str());
+                // LLAMA_LOG_INFO("slot_multi.offs: %s\n", offs_str.c_str());
 
                 std::string lens_str;
                 for (auto len : slot_multi.lens) {
                     lens_str += std::to_string(len) + " ";
                 }
-                LLAMA_LOG_INFO("slot_multi.lens: %s\n", lens_str.c_str());
+                // LLAMA_LOG_INFO("slot_multi.lens: %s\n", lens_str.c_str());
                 if (!slot_multi) {
                     LLAMA_LOG_ERROR("%s: failed to find split slot\n", __func__);
                     return -3;
@@ -1684,7 +1684,7 @@ int llama_context::decode(llama_batch & inp_batch) {
                 }
                 bg.save(slot);
             }
-            LLAMA_LOG_INFO("find_slot 이후 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
+            // LLAMA_LOG_INFO("find_slot 이후 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
 
             if (!kv_self->recurrent) {
                 // 휴리스틱: 캐시가 아직 완전히 활용되지 않았으면 전체 캐시에 어텐션하지 않음
@@ -1694,7 +1694,7 @@ int llama_context::decode(llama_batch & inp_batch) {
                 kv_self->n = std::min(kv_self->size, std::max(pad, GGML_PAD(kv_self->cell_max(), pad)));
             }
             // 내가추가 ----------------------------------------------------------------
-            LLAMA_LOG_INFO("n 재설정 이후 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
+            // LLAMA_LOG_INFO("n 재설정 이후 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
         }
 
         // KV 캐시 상태 디버깅용 (주석 처리됨)
@@ -1704,7 +1704,7 @@ int llama_context::decode(llama_batch & inp_batch) {
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         
-        LLAMA_LOG_INFO("Graph 실행!!!\n");
+        // LLAMA_LOG_INFO("Graph 실행!!!\n");
         // 계산 그래프 초기화
         auto * gf = graph_init();
         // 디코더 타입의 계산 그래프 구축
@@ -1756,7 +1756,7 @@ int llama_context::decode(llama_batch & inp_batch) {
                 const auto & multi = kv_self->last_slot_multi;
                 kv_self->head = (multi.offs.back() + multi.lens.back()) % kv_self->size;
             }
-            LLAMA_LOG_INFO("head 업데이트 이후 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
+            // LLAMA_LOG_INFO("head 업데이트 이후 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
             // 내가추가 ----------------------------------------------------------------
         }
 

@@ -35,7 +35,7 @@ struct seq_draft {
 };
 
 int main(int argc, char ** argv) {
-    common_log_set_verbosity_thold(LOG_DEFAULT_DEBUG);  // = 1  ─▶ DBG 출력 활성화
+    // common_log_set_verbosity_thold(LOG_DEFAULT_DEBUG);  // = 1  ─▶ DBG 출력 활성화
     /* 옵션: */
     common_log_set_colors    (common_log_main(), true); // ANSI 색상 켜기
     common_log_set_prefix    (common_log_main(), true); // 레벨/시간 접두사
@@ -94,7 +94,9 @@ int main(int argc, char ** argv) {
     ctx_tgt   = llama_init_tgt.context.get();
 
     // 내가추가 ----------------------------------------------------------------
-    allow_split(ctx_tgt, true);
+    allow_split(ctx_tgt, false);
+    const char* filename = "th01_2";
+    const bool save_profile = true;
     // ----------------------------------------------------------------
 
     // 드래프트 모델 로드를 위한 파라미터 설정
@@ -199,12 +201,12 @@ int main(int argc, char ** argv) {
 
     // 양쪽 모델에서 프롬프트 평가
     // 타겟 모델은 마지막 토큰을 별도로 처리 (최적화를 위해)
-    LOG_DBG("target decode\n");
+    // LOG_DBG("target decode\n");
     llama_decode(ctx_tgt, llama_batch_get_one( inp.data(), n_input - 1));
-    LOG_DBG("target decode\n");
+    // LOG_DBG("target decode\n");
     llama_decode(ctx_tgt, llama_batch_get_one(&inp.back(),           1));
     // 드래프트 모델은 전체 프롬프트를 한 번에 처리
-    LOG_DBG("draft decode\n");
+    // LOG_DBG("draft decode\n");
     llama_decode(ctx_dft, llama_batch_get_one( inp.data(), n_input));
 
     // 인코딩 종료 시간 기록
@@ -470,14 +472,14 @@ int main(int argc, char ** argv) {
                     // 토큰 출력 (색상 지정 여부에 따라)
                     if (params.use_color) {
                         // 시퀀스 번호에 따라 토큰 색상 지정
-                        //LOG("\u001b[%dm%s\u001b[37m", (36 - s_keep % 6), token_str.c_str());
+                        LOG("\u001b[%dm%s\u001b[37m", (36 - s_keep % 6), token_str.c_str());
                     } else {
-                        //LOG("%s", token_str.c_str());
+                        LOG("%s", token_str.c_str());
                     }
                     continue;  // 다음 드래프트 토큰 검증 계속
                 } else {
                     // 드래프트 토큰이 거부된 경우
-                    //LOG("%s", token_str.c_str());
+                    LOG("%s", token_str.c_str());
                     break;  // 드래프트 검증 루프 종료
                 }
             }
@@ -503,7 +505,7 @@ int main(int argc, char ** argv) {
                 // LOG_DBG("\n--- 선택한 seq만 남김 : draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str()); // draft kv cache
                 llama_kv_self_seq_cp  (ctx_dft, s_keep, 0, -1, -1);
                 llama_kv_self_seq_keep(ctx_dft, 0);
-                // LOG_DBG("\n--- seq를 0으로 변경 : draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str()); // draft kv cache
+                LOG_DBG("\n--- seq를 0으로 변경 : draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str()); // draft kv cache
                 
                 LOG_DBG("target KV 정리\n");
                 // LOG_DBG("\n--- 정리하기 전 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
@@ -518,15 +520,17 @@ int main(int argc, char ** argv) {
 
             //내가추가--------------------------------------
             {
-                auto st_d = kv_cache_fragmentation(ctx_dft);
-                auto st_t = kv_cache_fragmentation(ctx_tgt);
+                // auto st_d = kv_cache_fragmentation(ctx_dft);
+                // auto st_t = kv_cache_fragmentation(ctx_tgt);
 
                 // LOG_DBG("KV-FRAG draft : live %u, hole %u, %.2f%%\n",
                 //         st_d.live_cells,  st_d.inner_holes, frag_ratio(st_d));
                 // LOG_DBG("KV-FRAG target: live %u, hole %u, %.2f%%\n",
                 //         st_t.live_cells,  st_t.inner_holes, frag_ratio(st_t));
-                // save_frag("draft", n_past_dft, ctx_dft);
-                // save_frag("target", n_past_tgt, ctx_tgt);
+                if (save_profile) {
+                    save_frag("draft", n_past_dft, ctx_dft, filename);
+                    save_frag("target", n_past_tgt, ctx_tgt, filename);
+                }
             }   
             //----------------------------------------------------
 
@@ -753,9 +757,11 @@ int main(int argc, char ** argv) {
             llama_decode(ctx_tgt, batch_tgt);
             const auto t_dec_end = ggml_time_us();
             const float decode_time_ms = (t_dec_end - t_dec_start) / 1000.0f;
-            // LOG_DBG("target decode time: %f ms\n", decode_time_ms);
+            LOG_DBG("target decode time: %f ms\n", decode_time_ms);
             // 디코딩 시간 저장
-            // save_decode_time(n_past_tgt, decode_time_ms, ctx_tgt);
+            if (save_profile) {
+                save_decode_time(n_past_tgt, decode_time_ms, ctx_tgt, filename);
+            }
             LOG_DBG("\n--- 드래프트된 토큰 평가 완료 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
             ++n_past_tgt;  // 타겟 모델 컨텍스트 위치 증가
             

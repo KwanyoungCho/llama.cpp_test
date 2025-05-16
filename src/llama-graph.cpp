@@ -1535,7 +1535,7 @@ ggml_tensor * llm_graph_context::build_attn(
                     /* ne2 = */ (int64_t)len,
                     /*nb1 = */ k_cur->nb[1],
                     /*nb2 = */ k_cur->nb[2],
-                    /* offset = */ token_cursor * ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa)
+                    /* offset = */ token_cursor * k_cur->nb[2]
                 );
 
                 // k_cur 정보 출력
@@ -1575,11 +1575,11 @@ ggml_tensor * llm_graph_context::build_attn(
                     /* ne0 = */ v_cur->ne[0],
                     /* ne1 = */ (int64_t)len,
                     /* nb1 = */ v_cur->nb[1],
-                    /* offset = */ token_cursor * ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa)
+                    /* offset = */ token_cursor * v_cur->nb[1]
                 );
 
                 // v_cur 길이 출력
-                LLAMA_LOG_INFO("v_cur: %ld, %ld, %ld, %ld\n", v_cur->ne[0], v_cur->ne[1], v_cur->ne[2], v_cur->ne[3]);
+                // LLAMA_LOG_INFO("v_cur: %ld, %ld, %ld, %ld\n", v_cur->ne[0], v_cur->ne[1], v_cur->ne[2], v_cur->ne[3]);
                 // v_cur_seg 정보 출력
                 // LLAMA_LOG_INFO("v_cur_seg: %ld, %ld, %ld, %ld\n", v_cur_seg->ne[0], v_cur_seg->ne[1], v_cur_seg->ne[2], v_cur_seg->ne[3]);
                 // v_cache_seg 정보 출력

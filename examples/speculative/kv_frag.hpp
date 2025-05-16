@@ -193,20 +193,23 @@ inline std::string kv_cache_table(const llama_context * ctx,
 // CSV 헤더는 한 번만 찍도록 static 플래그 사용
 inline void save_frag(const char * kind,          // "draft" | "target"
                       int          seq_len,       // 현재 컨텍스트 길이
-                      const llama_context * ctx)  // 측정할 컨텍스트
+                      const llama_context * ctx,  // 측정할 컨텍스트
+                      const char* filename = "trial" // 파일 이름
+)
 {
     // 1) 목적 파일 경로 선택
-    const char * path = std::strcmp(kind, "draft") == 0
-                        ? "kv_frag_draft.csv"
-                        : "kv_frag_target.csv";
+    std::string path = std::string("kv_frag_") + kind + "_" + filename + ".csv";
+    // const char * path = std::strcmp(kind, "draft") == 0
+    //                     ? "kv_frag_draft.csv"
+    //                     : "kv_frag_target.csv";
 
     // 2) 헤더는 파일마다 첫 번만 출력
     static bool first_draft  = true;
     static bool first_target = true;
     bool & first = (std::strcmp(kind, "draft") == 0) ? first_draft : first_target;
 
-    FILE * fp = std::fopen(path, "a");
-    if (!fp) { std::perror(path); return; }
+    FILE * fp = std::fopen(path.c_str(), "a");
+    if (!fp) { std::perror(path.c_str()); return; }
 
     if (first) {
         std::fprintf(fp, "seq_len,total,ratio\n");
@@ -226,17 +229,21 @@ inline void save_frag(const char * kind,          // "draft" | "target"
 // ---------------------------------------------------------------
 inline void save_decode_time(int n_past_tgt,           // 타겟 모델 컨텍스트 위치 (token position)
                             float decode_time_ms,     // 디코딩에 소요된 시간 (밀리초)
-                            const llama_context * ctx_tgt) // 타겟 컨텍스트 (do_defrag 상태 확인용)
+                            const llama_context * ctx_tgt, // 타겟 컨텍스트 (do_defrag 상태 확인용)
+                            const char* filename = "trial" // 파일 이름
+)
 {
-    const char* path = "decode_time.csv";
     
     // 헤더는 파일이 존재하지 않을 때만 출력
     static bool first_write = true;
     
+    // 파일 경로 생성
+    std::string path = std::string("decode_time_") + filename + ".csv";
+    
     // 파일이 존재하는지 확인
     bool file_exists = false;
     {
-        FILE* fp = std::fopen(path, "r");
+        FILE* fp = std::fopen(path.c_str(), "r");
         if (fp) {
             file_exists = true;
             std::fclose(fp);
@@ -251,9 +258,9 @@ inline void save_decode_time(int n_past_tgt,           // 타겟 모델 컨텍�
     }
     
     // 파일 열기 (추가 모드)
-    FILE* fp = std::fopen(path, "a");
+    FILE* fp = std::fopen(path.c_str(), "a");
     if (!fp) { 
-        std::perror(path); 
+        std::perror(path.c_str()); 
         return; 
     }
     
