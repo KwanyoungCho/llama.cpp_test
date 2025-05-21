@@ -280,3 +280,52 @@ inline void save_decode_time(int n_past_tgt,           // 타겟 모델 컨텍�
 inline void allow_split(llama_context * ctx, bool enable) {
     ctx->kv_cache_allow_split(enable);
 }
+
+// seq_id 우선 정렬
+// 정렬 함수 수정
+inline std::vector<int> reorder_batch_by_seq(llama_batch &batch) {
+    struct TokenInfo {
+        int token;
+        int pos;
+        std::vector<int> seq_ids;
+        int8_t logit;
+        int orig_idx;  // 원본 인덱스 저장
+    };
+    
+    std::vector<TokenInfo> tokens;
+    for (int t = 0; t < batch.n_tokens; ++t) {
+        TokenInfo info;
+        info.token = batch.token[t];
+        info.pos = batch.pos[t];
+        info.seq_ids = std::vector<int>(batch.seq_id[t], batch.seq_id[t] + batch.n_seq_id[t]);
+        info.logit = batch.logits ? batch.logits[t] : 0;
+        info.orig_idx = t;  // 원본 인덱스 저장
+        tokens.push_back(info);
+    }
+    
+    // seq_id[0] → pos 기준 정렬
+    std::sort(tokens.begin(), tokens.end(), [](const TokenInfo &a, const TokenInfo &b) {
+        if (a.seq_ids[0] != b.seq_ids[0])
+            return a.seq_ids[0] < b.seq_ids[0];
+        return a.pos < b.pos;
+    });
+    
+    // 인덱스 매핑 생성 (원래 인덱스 → 새 인덱스)
+    std::vector<int> old_to_new_idx(batch.n_tokens, -1);
+    for (int t = 0; t < batch.n_tokens; ++t) {
+        old_to_new_idx[tokens[t].orig_idx] = t;
+    }
+    
+    // 복사
+    for (int t = 0; t < batch.n_tokens; ++t) {
+        batch.token[t] = tokens[t].token;
+        batch.pos[t] = tokens[t].pos;
+        batch.n_seq_id[t] = tokens[t].seq_ids.size();
+        for (size_t i = 0; i < tokens[t].seq_ids.size(); ++i) {
+            batch.seq_id[t][i] = tokens[t].seq_ids[i];
+        }
+        if (batch.logits) batch.logits[t] = tokens[t].logit;
+    }
+    
+    return old_to_new_idx;  // 인덱스 매핑 반환
+}

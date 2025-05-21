@@ -907,12 +907,12 @@ void llama_context::kv_self_update() {
         LLAMA_LOG_DEBUG("%s: defragmenting KV cache\n", __func__);  // 디버그 로그
 
         // 전체 defrag 과정 시간 측정 시작
-        const int64_t t_defrag_start = ggml_time_us();
+        // const int64_t t_defrag_start = ggml_time_us();
 
         // 조각 모음 준비 (그래프 노드 수 제한 확인)
         if (kv->defrag_prepare(graph_max_nodes())) {
             // 그래프 빌드 및 계산 시간 측정 시작
-            const int64_t t_graph_start = ggml_time_us();
+            // const int64_t t_graph_start = ggml_time_us();
 
             ggml_backend_sched_reset(sched.get());  // 스케줄러 초기화
 
@@ -931,8 +931,8 @@ void llama_context::kv_self_update() {
             graph_compute(gf, false);
 
             // 그래프 빌드 및 계산 시간 측정 종료
-            const int64_t t_graph_end = ggml_time_us();
-            LLAMA_LOG_INFO("%s: defrag graph build and compute took %.3f ms\n", __func__, (t_graph_end - t_graph_start) / 1000.0f);
+            // const int64_t t_graph_end = ggml_time_us();
+            // LLAMA_LOG_INFO("%s: defrag graph build and compute took %.3f ms\n", __func__, (t_graph_end - t_graph_start) / 1000.0f);
 
             need_reserve = true;  // 리소스 예약 필요 표시
         }
@@ -940,8 +940,8 @@ void llama_context::kv_self_update() {
         kv->do_defrag = false;  // 조각 모음 완료 표시
 
         // 전체 defrag 과정 시간 측정 종료
-        const int64_t t_defrag_end = ggml_time_us();
-        LLAMA_LOG_INFO("%s: total defragmentation took %.3f ms\n", __func__, (t_defrag_end - t_defrag_start) / 1000.0f);
+        // const int64_t t_defrag_end = ggml_time_us();
+        // LLAMA_LOG_INFO("%s: total defragmentation took %.3f ms\n", __func__, (t_defrag_end - t_defrag_start) / 1000.0f);
     }
 
     // 필요한 경우 최악의 경우 그래프 예약
@@ -1656,11 +1656,12 @@ int llama_context::decode(llama_batch & inp_batch) {
             if (kv_self->allow_split) {
                 llama_kv_cache_slot_info_multi slot_multi = kv_self->find_slot_split(ubatch);
                 // off 랑 len 출력
-                std::string offs_str;
-                for (auto off : slot_multi.offs) {
-                    offs_str += std::to_string(off) + " ";
-                }
+                // std::string offs_str;
+                // for (auto off : slot_multi.offs) {
+                //     offs_str += std::to_string(off) + " ";
+                // }
                 // LLAMA_LOG_INFO("slot_multi.offs: %s\n", offs_str.c_str());
+                // LLAMA_LOG_INFO("%zu\n", slot_multi.offs.size());
 
                 std::string lens_str;
                 for (auto len : slot_multi.lens) {
@@ -1913,7 +1914,7 @@ int llama_context::decode(llama_batch & inp_batch) {
         // - 패딩도 사용된 토큰 수에 포함
         
         // 조각화 감지 시작 시간 측정
-        const auto t_frag_check_start = ggml_time_us();
+        // const auto t_frag_check_start = ggml_time_us();
         
         // 조각화 비율 계산: 미사용 셀 비율
         const float fragmentation = kv_self->n < 2048 ? 
@@ -1922,10 +1923,10 @@ int llama_context::decode(llama_batch & inp_batch) {
         // 조각화 비율이 임계값을 초과하면 조각 모음 요청
         if (fragmentation > cparams.defrag_thold) {
             // 조각화 감지 종료 시간 측정
-            const auto t_frag_check_end = ggml_time_us();
-            LLAMA_LOG_INFO("%s: fragmentation check took %.3f ms\n", __func__, (t_frag_check_end - t_frag_check_start) / 1000.0f);
+            // const auto t_frag_check_end = ggml_time_us();
+            // LLAMA_LOG_INFO("%s: fragmentation check took %.3f ms\n", __func__, (t_frag_check_end - t_frag_check_start) / 1000.0f);
             
-            LLAMA_LOG_INFO("%s: fragmentation: %.2f - requesting defrag\n", __func__, fragmentation);
+            // LLAMA_LOG_INFO("%s: fragmentation: %.2f - requesting defrag\n", __func__, fragmentation);
 
             // 다음 llama_kv_cache_update 호출 시 조각 모음 수행하도록 표시
             kv_self->defrag();

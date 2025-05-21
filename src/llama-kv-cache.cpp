@@ -1236,7 +1236,7 @@ bool llama_kv_cache_unified::defrag_prepare(int32_t n_max_nodes) {
     LLAMA_LOG_DEBUG("expected gf nodes: %u\n", 6*n_moves*n_layer);
     
     // defrag_prepare 함수의 실행 시간 출력
-    LLAMA_LOG_INFO("%s: defrag_prepare took %.3f ms\n", __func__, (t_end - t_start) / 1000.0f);
+    // LLAMA_LOG_INFO("%s: defrag_prepare took %.3f ms\n", __func__, (t_end - t_start) / 1000.0f);
 
     // 조각 모음 계획 수립 완료
     // 실제 셀 데이터 이동은 defrag() 함수에서 수행됨
