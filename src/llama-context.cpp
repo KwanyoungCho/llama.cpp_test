@@ -1476,6 +1476,9 @@ int llama_context::decode(llama_batch & inp_batch) {
     const int64_t n_tokens_all = batch.n_tokens;
     const int64_t n_embd       = hparams.n_embd;
 
+    // 내가추가 ----------------------------------------------------------------
+    uint32_t min_hole_size = 5; // 최소 KV 캐시 빈공간 크기
+    // ----------------------------------------------------------------
     // 배치 가드 클래스 - KV 캐시 슬롯 복원을 위한 RAII 패턴 구현
     // TODO: 나중에 제거 예정
     class batch_guard {
@@ -1654,7 +1657,7 @@ int llama_context::decode(llama_batch & inp_batch) {
             // bg.save(slot_info);
             // LLAMA_LOG_INFO("find_slot 이전 n: %u, used: %u, head: %u\n", kv_self->n, kv_self->used, kv_self->head);
             if (kv_self->allow_split) {
-                llama_kv_cache_slot_info_multi slot_multi = kv_self->find_slot_split(ubatch);
+                llama_kv_cache_slot_info_multi slot_multi = kv_self->find_slot_split(ubatch, min_hole_size);
                 // off 랑 len 출력
                 // std::string offs_str;
                 // for (auto off : slot_multi.offs) {
@@ -1663,10 +1666,10 @@ int llama_context::decode(llama_batch & inp_batch) {
                 // LLAMA_LOG_INFO("slot_multi.offs: %s\n", offs_str.c_str());
                 // LLAMA_LOG_INFO("%zu\n", slot_multi.offs.size());
 
-                std::string lens_str;
-                for (auto len : slot_multi.lens) {
-                    lens_str += std::to_string(len) + " ";
-                }
+                // std::string lens_str;
+                // for (auto len : slot_multi.lens) {
+                //     lens_str += std::to_string(len) + " ";
+                // }
                 // LLAMA_LOG_INFO("slot_multi.lens: %s\n", lens_str.c_str());
                 if (!slot_multi) {
                     LLAMA_LOG_ERROR("%s: failed to find split slot\n", __func__);

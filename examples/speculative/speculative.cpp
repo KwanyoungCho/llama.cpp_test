@@ -53,7 +53,7 @@ inline void update_draft_indices(std::vector<seq_draft> &drafts,
 }
 
 int main(int argc, char ** argv) {
-    common_log_set_verbosity_thold(LOG_DEFAULT_DEBUG);  // = 1  ─▶ DBG 출력 활성화
+    // common_log_set_verbosity_thold(LOG_DEFAULT_DEBUG);  // = 1  ─▶ DBG 출력 활성화
     /* 옵션: */
     common_log_set_colors    (common_log_main(), true); // ANSI 색상 켜기
     common_log_set_prefix    (common_log_main(), true); // 레벨/시간 접두사
@@ -95,7 +95,7 @@ int main(int argc, char ** argv) {
     std::uniform_real_distribution<> u_dist;
 
     // llama.cpp 백엔드 초기화
-    llama_backend_init();
+    llama_backend_init(); 
     llama_numa_init(params.numa);
 
     // 모델과 컨텍스트 포인터 초기화
@@ -112,10 +112,10 @@ int main(int argc, char ** argv) {
     ctx_tgt   = llama_init_tgt.context.get();
 
     // 내가추가 ----------------------------------------------------------------
-    allow_split(ctx_tgt, false);
-    const char* filename = "split_sort";
-    const bool save_profile = false;
-    const bool seq_id_sort = false;
+    allow_split(ctx_tgt, true);
+    const char* filename = "split_sort_t4";
+    const bool save_profile = true;
+    const bool seq_id_sort = true;
     // ----------------------------------------------------------------
 
     // 드래프트 모델 로드를 위한 파라미터 설정
@@ -712,7 +712,7 @@ int main(int argc, char ** argv) {
                     const llama_token id = cur_p->data[is].id;
                     const int s = sa[is];
 
-                    // 샘플러에 토큰 수락 알림
+                    // 샘플러에 토큰 수락 알림`
                     common_sampler_accept(drafts[s].smpl, id, true);
 
                     // 시퀀스에 토큰 및 확률 분포 추가

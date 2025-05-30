@@ -878,10 +878,12 @@ llama_kv_cache_slot_info llama_kv_cache_unified::find_slot(
 }
 
 // 내가추가 ----------------------------------------------------------------
-llama_kv_cache_slot_info_multi llama_kv_cache_unified::find_slot_split(const llama_ubatch & ubatch) {
+llama_kv_cache_slot_info_multi llama_kv_cache_unified::find_slot_split(
+    const llama_ubatch & ubatch,
+    uint32_t min_hole_size=0) {
     llama_kv_cache_slot_info_multi out;               // return struct
     const uint32_t n_tokens     = ubatch.n_tokens;
-    const uint32_t n_seqs       = ubatch.n_seqs;
+    // const uint32_t n_seqs       = ubatch.n_seqs;
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
 
     //----------------------------------------------------------------
@@ -918,6 +920,13 @@ llama_kv_cache_slot_info_multi llama_kv_cache_unified::find_slot_split(const lla
 
         if (hole == 0) {               // 현재 셀이 사용중
             ++scan; ++visited;
+            continue;
+        }
+
+        if (hole < min_hole_size) { // 빈 공간이 최소 크기보다 작음
+            // LLAMA_LOG_INFO("hole < min_hole_size: %u < %u\n", hole, min_hole_size);
+            scan    += hole;
+            visited += hole;
             continue;
         }
 
@@ -1062,7 +1071,7 @@ size_t llama_kv_cache_unified::size_v_bytes() const {
  */
 bool llama_kv_cache_unified::defrag_prepare(int32_t n_max_nodes) {
     // 시간 측정 시작
-    const int64_t t_start = ggml_time_us();
+    // const int64_t t_start = ggml_time_us();
 
     // 모델의 레이어 수 가져오기
     const uint32_t n_layer = hparams.n_layer;
@@ -1226,7 +1235,7 @@ bool llama_kv_cache_unified::defrag_prepare(int32_t n_max_nodes) {
     }
 
     // 시간 측정 종료
-    const int64_t t_end = ggml_time_us();
+    // const int64_t t_end = ggml_time_us();
     
     // 디버그 로그: 이동 계획된 셀 수 출력
     LLAMA_LOG_DEBUG("(tmp log) KV defrag cell moves: %u\n", n_moves);

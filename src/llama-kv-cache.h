@@ -182,7 +182,7 @@ public:
 
     // 내가추가 ----------------------------------------------------------------
     llama_kv_cache_slot_info find_slot(const llama_ubatch & batch); // 원래 함수 이름 변경 find_slot -> find_slot_contig
-    llama_kv_cache_slot_info_multi find_slot_split(const llama_ubatch & batch); // Target model에 적용
+    llama_kv_cache_slot_info_multi find_slot_split(const llama_ubatch & batch, uint32_t min_hole_size); // Target model에 적용
     // ----------------------------------------------------------------
 
     // 컨텍스트 파라미터에 따른 패딩 값 계산
