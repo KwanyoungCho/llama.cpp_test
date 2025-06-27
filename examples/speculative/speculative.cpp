@@ -53,7 +53,7 @@ inline void update_draft_indices(std::vector<seq_draft> &drafts,
 }
 
 int main(int argc, char ** argv) {
-    // common_log_set_verbosity_thold(LOG_DEFAULT_DEBUG);  // = 1  ─▶ DBG 출력 활성화
+    common_log_set_verbosity_thold(LOG_DEFAULT_DEBUG);  // = 1  ─▶ DBG 출력 활성화
     /* 옵션: */
     common_log_set_colors    (common_log_main(), true); // ANSI 색상 켜기
     common_log_set_prefix    (common_log_main(), true); // 레벨/시간 접두사
@@ -112,10 +112,10 @@ int main(int argc, char ** argv) {
     ctx_tgt   = llama_init_tgt.context.get();
 
     // 내가추가 ----------------------------------------------------------------
-    allow_split(ctx_tgt, true);
+    allow_split(ctx_tgt, false);
     const char* filename = "split_sort_t4";
-    const bool save_profile = true;
-    const bool seq_id_sort = true;
+    const bool save_profile = false;
+    const bool seq_id_sort = false;
     // ----------------------------------------------------------------
 
     // 드래프트 모델 로드를 위한 파라미터 설정
@@ -528,14 +528,14 @@ int main(int argc, char ** argv) {
                 // LOG_DBG("\n--- seq를 0으로 변경 : draft bitmap ---\n%s\n", kv_cache_table(ctx_dft).c_str()); // draft kv cache
                 
                 LOG_DBG("target KV 정리\n");
-                // LOG_DBG("\n--- 정리하기 전 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
+                LOG_DBG("\n--- 정리하기 전 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
                 llama_kv_self_seq_rm  (ctx_tgt, s_keep, n_past_tgt, -1);
-                // LOG_DBG("\n--- reject seq 제거 : target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
+                LOG_DBG("\n--- reject seq 제거 : target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
                 llama_kv_self_seq_keep(ctx_tgt, s_keep);
                 LOG_DBG("\n--- keep seq 남김 : target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
                 llama_kv_self_seq_cp  (ctx_tgt, s_keep, 0, -1, -1);
                 llama_kv_self_seq_keep(ctx_tgt, 0);
-                // LOG_DBG("\n--- seq를 0으로 변경 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
+                LOG_DBG("\n--- seq를 0으로 변경 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
             }
 
             //내가추가--------------------------------------
@@ -760,14 +760,14 @@ int main(int argc, char ** argv) {
         LOG_DBG("///////////////////////////////////////////////////////////////////////////// \n\n");
         {
             LOG_DBG("target KV 정리\n");
-            // LOG_DBG("\n--- 정리하기 전 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
+            LOG_DBG("\n--- 정리하기 전 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
             // KV 캐시 준비: 첫 번째 시퀀스만 유지하고 나머지 시퀀스에 복사
             llama_kv_self_seq_keep(ctx_tgt, 0);
-            // LOG_DBG("\n--- 쓸모없는거 제거 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
+            LOG_DBG("\n--- 쓸모없는거 제거 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
             for (int s = 1; s < n_seq_dft; ++s) {
                 llama_kv_self_seq_cp(ctx_tgt, 0, s, -1, -1);
             }
-            // LOG_DBG("\n--- draft seq 개수 만큼 추가 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
+            LOG_DBG("\n--- draft seq 개수 만큼 추가 target bitmap ---\n%s\n", kv_cache_table(ctx_tgt).c_str()); // target kv cache
             
             // 타겟 모델에서 배치 디코딩
             // LOG_DBG("target batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_tgt, batch_tgt).c_str());
